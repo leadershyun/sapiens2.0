@@ -4,17 +4,18 @@ Sapiens2.0 - AI Agent Prototype
 OpenClaw과 유사한 구조의 AI 에이전트 프로토타입입니다.
 
 기능:
-  1. CMD(터미널)에서 에이전트와 대화
+  1. PowerShell(터미널)에서 에이전트와 대화
   2. 파일 시스템 탐색·수정·실행 등 컴퓨터 통제
   3. 사용자의 GitHub Copilot 계정 연동 (코드 생성)
 
-사용법:
+사용법 (PowerShell):
   python main.py                        # 실행 (토큰 미입력 시 실행 중 설정 가능)
-  python main.py --token <GITHUB_TOKEN> # GitHub OAuth/PAT 토큰 직접 지정
+  python main.py --token <GITHUB_TOKEN> # GitHub PAT 토큰 직접 지정
+  python main.py --client-id <ID>       # OAuth App Client ID로 device flow 사용
 
 주요 명령어 (실행 후 입력):
-  /auth                 GitHub Copilot 인증 (device flow)
-  /auth <token>         GitHub OAuth/PAT 토큰 직접 입력
+  /auth                 GitHub PAT 토큰 입력 프롬프트 (권장)
+  /auth <token>         GitHub PAT 토큰 직접 입력
   /pwd                  현재 작업 디렉토리 출력
   /ls [경로]            디렉토리 목록 출력
   /cat <파일>           파일 내용 출력
@@ -27,10 +28,11 @@ OpenClaw과 유사한 구조의 AI 에이전트 프로토타입입니다.
   /exit 또는 /quit      프로그램 종료
 
 예시 흐름:
-  [사용자] 현재 작업폴더 보여줘
-  [에이전트] /pwd 명령을 사용하거나, 직접 /pwd 를 입력하세요.
+  [사용자] /auth
+  [Sapiens2.0] GitHub PAT 토큰을 입력하세요: ghp_xxxx...
+  [Sapiens2.0] ✅ GitHub 토큰이 설정되었습니다.
   [사용자] /pwd
-  [Sapiens2.0] 현재 폴더: /home/user/sapiens2.0
+  [Sapiens2.0] 현재 폴더: C:\\Users\\user\\sapiens2.0
   [사용자] /codegen 헬로 sapiens2.0을 출력하는 파이썬 코드
   [Sapiens2.0] Copilot에게 코드 요청 중...
   [Sapiens2.0] 생성된 코드: print('hello sapiens2.0')
@@ -40,6 +42,7 @@ OpenClaw과 유사한 구조의 AI 에이전트 프로토타입입니다.
 """
 
 import argparse
+import getpass
 import os
 import subprocess
 import sys
@@ -559,8 +562,8 @@ class AgentCore:
         if not self.copilot.is_authenticated():
             return (
                 "💬 Copilot이 연결되어 있지 않습니다.\n"
-                "  /auth <token>  을 사용해 GitHub 토큰을 설정하거나,\n"
-                "  /auth          를 입력해 device flow 인증을 시작하세요.\n\n"
+                "  /auth          를 입력해 GitHub PAT 토큰 입력 프롬프트를 시작하세요.\n"
+                "  /auth <token>  으로 토큰을 직접 전달할 수도 있습니다.\n\n"
                 "  슬래시 명령(/pwd, /ls, /help 등)은 인증 없이 사용 가능합니다."
             )
 
@@ -577,13 +580,27 @@ class AgentCore:
         # ── 인증 ────────────────────────────────
         if cmd == "/auth":
             if arg1:
-                # 직접 토큰 입력
+                # 직접 토큰 입력 (/auth <token>)
                 self.copilot.set_token(arg1)
                 return "✅ GitHub 토큰이 설정되었습니다."
-            else:
-                # Device flow 인증
+            elif self.client_id:
+                # OAuth App Client ID가 있을 때만 device flow 사용
                 ok = self.copilot.authenticate_device_flow(self.client_id)
                 return "✅ 인증 완료!" if ok else "❌ 인증 실패. 다시 시도하세요."
+            else:
+                # Client ID 미설정: GitHub PAT 직접 입력 프롬프트
+                print("  GitHub Personal Access Token (PAT)을 입력하세요.")
+                print("  PAT 생성: https://github.com/settings/tokens")
+                print("  GitHub Copilot 구독이 있는 계정의 토큰이어야 합니다.")
+                print("  또는: /auth <token> 으로 토큰을 바로 전달할 수 있습니다.")
+                try:
+                    token = getpass.getpass("  토큰 입력 (입력 내용 숨김): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    return "❌ 인증이 취소되었습니다."
+                if not token:
+                    return "❌ 토큰이 입력되지 않았습니다."
+                self.copilot.set_token(token)
+                return "✅ GitHub 토큰이 설정되었습니다."
 
         # ── 파일 시스템 ─────────────────────────
         if cmd == "/pwd":
@@ -742,8 +759,9 @@ def _help_text() -> str:
         ╚══════════════════════════════════════════╝
 
         [인증]
-          /auth                GitHub device flow 인증 시작
-          /auth <token>        GitHub OAuth/PAT 토큰 직접 설정
+          /auth                GitHub PAT 토큰 입력 프롬프트 시작
+          /auth <token>        GitHub PAT 토큰 직접 설정
+          ※ device flow를 쓰려면: python main.py --client-id <OAuth_App_ID>
 
         [파일 시스템]
           /pwd                 현재 작업 디렉토리 출력
@@ -766,6 +784,10 @@ def _help_text() -> str:
 
         슬래시 명령 외 일반 텍스트 입력은 Copilot과의 대화로 처리됩니다.
         (Copilot 인증 필요)
+
+        [PowerShell 실행 예시]
+          python .\\main.py
+          python .\\main.py --token ghp_xxxx...
     """)
 
 
@@ -779,10 +801,10 @@ def main():
         description="Sapiens2.0 - AI Agent (GitHub Copilot 연동)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
-            예시:
-              python main.py                        # 기본 실행
-              python main.py --token ghp_xxx...     # 토큰 직접 지정
-              python main.py --client-id abc123     # 커스텀 OAuth App ID 사용
+            예시 (PowerShell):
+              python .\\main.py                        # 기본 실행
+              python .\\main.py --token ghp_xxx...     # PAT 토큰 직접 지정
+              python .\\main.py --client-id abc123     # OAuth App device flow 사용
         """),
     )
     parser.add_argument(
@@ -812,8 +834,9 @@ def main():
     if args.token:
         print("  ✅ GitHub 토큰이 설정되었습니다.")
     else:
-        print("  ℹ️  Copilot 연동을 위해 /auth 를 실행하거나")
+        print("  ℹ️  Copilot 연동을 위해 /auth 를 실행해 PAT 토큰을 입력하거나")
         print("     --token <GITHUB_TOKEN> 옵션을 사용하세요.")
+        print("     PAT 생성: https://github.com/settings/tokens (Copilot 구독 필요)")
     print("=" * 50)
     print()
 
