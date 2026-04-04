@@ -9,13 +9,12 @@ OpenClaw과 유사한 구조의 AI 에이전트 프로토타입입니다.
   3. 사용자의 GitHub Copilot 계정 연동 (코드 생성)
 
 사용법 (PowerShell):
-  python main.py                        # 실행 (토큰 미입력 시 실행 중 설정 가능)
-  python main.py --token <GITHUB_TOKEN> # GitHub PAT 토큰 직접 지정
-  python main.py --client-id <ID>       # OAuth App Client ID로 device flow 사용
+  python .\\main.py                        # 실행 후 /auth 로 GitHub device 인증
+  python .\\main.py --token <GITHUB_TOKEN> # GitHub PAT/OAuth 토큰 직접 지정
 
 주요 명령어 (실행 후 입력):
-  /auth                 GitHub PAT 토큰 입력 프롬프트 (권장)
-  /auth <token>         GitHub PAT 토큰 직접 입력
+  /auth                 GitHub device flow 인증 시작 (OpenClaw 방식, 권장)
+  /auth <token>         GitHub PAT/OAuth 토큰 직접 입력
   /pwd                  현재 작업 디렉토리 출력
   /ls [경로]            디렉토리 목록 출력
   /cat <파일>           파일 내용 출력
@@ -27,22 +26,19 @@ OpenClaw과 유사한 구조의 AI 에이전트 프로토타입입니다.
   /help                 도움말 출력
   /exit 또는 /quit      프로그램 종료
 
-예시 흐름:
-  [사용자] /auth
-  [Sapiens2.0] GitHub PAT 토큰을 입력하세요: ghp_xxxx...
-  [Sapiens2.0] ✅ GitHub 토큰이 설정되었습니다.
-  [사용자] /pwd
-  [Sapiens2.0] 현재 폴더: C:\\Users\\user\\sapiens2.0
-  [사용자] /codegen 헬로 sapiens2.0을 출력하는 파이썬 코드
-  [Sapiens2.0] Copilot에게 코드 요청 중...
-  [Sapiens2.0] 생성된 코드: print('hello sapiens2.0')
+인증 흐름 (OpenClaw 방식):
+  1. PowerShell에서 python .\\main.py 실행
+  2. /auth 입력
+  3. 터미널에 표시된 코드(예: ABCD-1234)를 확인
+  4. 브라우저에서 https://github.com/login/device 로 이동하여 코드 입력
+  5. GitHub 계정으로 승인
+  6. 터미널에 ✅ 인증 성공 메시지 표시 후 Copilot 사용 가능
 
 의존성 (requirements.txt 참조):
   pip install requests
 """
 
 import argparse
-import getpass
 import os
 import subprocess
 import sys
@@ -61,12 +57,11 @@ except ImportError:
 #  상수 / 설정
 # ─────────────────────────────────────────────
 
-# GitHub OAuth App Client ID.
-# device flow 인증을 위해 자신의 GitHub OAuth App을 등록하고
-# 해당 App의 Client ID를 --client-id 인자로 전달하거나 아래 값을 교체하세요.
-# GitHub OAuth App 등록: https://github.com/settings/developers
-# 아래 기본값은 빈 문자열이며, device flow 사용 시 반드시 --client-id 를 지정해야 합니다.
-DEFAULT_CLIENT_ID = ""  # 예: "Ov23liABCDEF1234abcd" (본인의 OAuth App Client ID)
+# GitHub OAuth App Client ID (GitHub CLI 공개 앱 — Copilot 인증에 사용됨).
+# OpenClaw 방식과 동일하게 사용자가 별도 OAuth App을 등록하지 않아도
+# 바로 GitHub device flow 인증을 사용할 수 있습니다.
+# 출처: https://github.com/cli/cli (공개 OAuth App)
+DEFAULT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 
 # GitHub Copilot 내부 API 엔드포인트
 COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
@@ -85,6 +80,9 @@ COPILOT_TOKEN_LIFETIME_SECONDS = 1800
 # 위험 작업 목록 (실행 전 사용자 확인 요청)
 DANGEROUS_EXTENSIONS = {".sh", ".bat", ".cmd", ".ps1", ".exe"}
 CONFIRM_REQUIRED_COMMANDS = {"rm", "del", "rmdir", "rd", "format", "mkfs", "dd"}
+
+# 시작 배너 너비
+BANNER_WIDTH = 54
 
 
 # ─────────────────────────────────────────────
@@ -141,7 +139,7 @@ class CopilotModule:
             resp = requests.post(
                 GH_DEVICE_CODE_URL,
                 headers={"Accept": "application/json"},
-                data={"client_id": client_id, "scope": "copilot"},
+                data={"client_id": client_id, "scope": "read:user"},
                 timeout=10,
             )
             resp.raise_for_status()
@@ -156,10 +154,14 @@ class CopilotModule:
         interval = data.get("interval", 5)
         expires_in = data.get("expires_in", 900)
 
-        print(f"\n  다음 URL을 브라우저에서 열고 아래 코드를 입력하세요:")
-        print(f"  URL  : {verification_uri}")
-        print(f"  코드 : {user_code}")
-        print(f"  (유효 시간: {expires_in}초)\n")
+        print(f"\n  ┌─────────────────────────────────────────────────┐")
+        print(f"  │  브라우저에서 아래 URL을 열고 코드를 입력하세요.  │")
+        print(f"  │                                                 │")
+        print(f"  │  URL  : {verification_uri:<39} │")
+        print(f"  │  코드 : {user_code:<39} │")
+        print(f"  │                                                 │")
+        print(f"  │  유효 시간: {expires_in}초{' ' * (36 - len(str(expires_in)))}│")
+        print(f"  └─────────────────────────────────────────────────┘\n")
 
         # 2단계: 승인 폴링
         deadline = time.time() + expires_in
@@ -562,8 +564,9 @@ class AgentCore:
         if not self.copilot.is_authenticated():
             return (
                 "💬 Copilot이 연결되어 있지 않습니다.\n"
-                "  /auth          를 입력해 GitHub PAT 토큰 입력 프롬프트를 시작하세요.\n"
-                "  /auth <token>  으로 토큰을 직접 전달할 수도 있습니다.\n\n"
+                "  /auth          를 입력해 GitHub device flow 인증을 시작하세요.\n"
+                "                 (브라우저에서 https://github.com/login/device 접속 후 코드 입력)\n"
+                "  /auth <token>  으로 GitHub PAT/OAuth 토큰을 직접 전달할 수도 있습니다.\n\n"
                 "  슬래시 명령(/pwd, /ls, /help 등)은 인증 없이 사용 가능합니다."
             )
 
@@ -583,24 +586,10 @@ class AgentCore:
                 # 직접 토큰 입력 (/auth <token>)
                 self.copilot.set_token(arg1)
                 return "✅ GitHub 토큰이 설정되었습니다."
-            elif self.client_id:
-                # OAuth App Client ID가 있을 때만 device flow 사용
+            else:
+                # OpenClaw 방식: GitHub device flow 인증
                 ok = self.copilot.authenticate_device_flow(self.client_id)
                 return "✅ 인증 완료!" if ok else "❌ 인증 실패. 다시 시도하세요."
-            else:
-                # Client ID 미설정: GitHub PAT 직접 입력 프롬프트
-                print("  GitHub Personal Access Token (PAT)을 입력하세요.")
-                print("  PAT 생성: https://github.com/settings/tokens")
-                print("  GitHub Copilot 구독이 있는 계정의 토큰이어야 합니다.")
-                print("  또는: /auth <token> 으로 토큰을 바로 전달할 수 있습니다.")
-                try:
-                    token = getpass.getpass("  토큰 입력 (입력 내용 숨김): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    return "❌ 인증이 취소되었습니다."
-                if not token:
-                    return "❌ 토큰이 입력되지 않았습니다."
-                self.copilot.set_token(token)
-                return "✅ GitHub 토큰이 설정되었습니다."
 
         # ── 파일 시스템 ─────────────────────────
         if cmd == "/pwd":
@@ -758,10 +747,11 @@ def _help_text() -> str:
         ║          Sapiens2.0 명령어 도움말          ║
         ╚══════════════════════════════════════════╝
 
-        [인증]
-          /auth                GitHub PAT 토큰 입력 프롬프트 시작
-          /auth <token>        GitHub PAT 토큰 직접 설정
-          ※ device flow를 쓰려면: python main.py --client-id <OAuth_App_ID>
+        [인증] — OpenClaw 방식 (GitHub device flow)
+          /auth                GitHub device flow 인증 시작 (권장)
+                               → 터미널에 표시된 코드를 확인하고
+                                 https://github.com/login/device 에서 입력
+          /auth <token>        GitHub PAT/OAuth 토큰 직접 설정
 
         [파일 시스템]
           /pwd                 현재 작업 디렉토리 출력
@@ -788,6 +778,14 @@ def _help_text() -> str:
         [PowerShell 실행 예시]
           python .\\main.py
           python .\\main.py --token ghp_xxxx...
+
+        [인증 흐름 예시 (PowerShell)]
+          PS> python .\\main.py
+          [사용자] /auth
+          [Sapiens2.0] GitHub device flow 인증을 시작합니다...
+          [Sapiens2.0] URL  : https://github.com/login/device
+          [Sapiens2.0] 코드 : ABCD-1234
+          → 브라우저에서 위 URL을 열고 코드를 입력·승인하면 자동으로 인증됩니다.
     """)
 
 
@@ -802,23 +800,30 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             예시 (PowerShell):
-              python .\\main.py                        # 기본 실행
-              python .\\main.py --token ghp_xxx...     # PAT 토큰 직접 지정
-              python .\\main.py --client-id abc123     # OAuth App device flow 사용
+              python .\\main.py                    # 기본 실행 후 /auth 로 device flow 인증
+              python .\\main.py --token ghp_xxx... # PAT/OAuth 토큰 직접 지정
+
+            인증 흐름 (OpenClaw 방식):
+              1. python .\\main.py 실행
+              2. /auth 입력
+              3. 터미널에 표시된 코드 확인
+              4. 브라우저에서 https://github.com/login/device 열고 코드 입력·승인
+              5. 터미널에 ✅ 인증 성공 표시 → Copilot 사용 시작
         """),
     )
     parser.add_argument(
         "--token",
         metavar="GITHUB_TOKEN",
         default=os.environ.get("GITHUB_TOKEN"),
-        help="GitHub OAuth/PAT 토큰 (환경변수 GITHUB_TOKEN도 인식)",
+        help="GitHub OAuth/PAT 토큰 (환경변수 GITHUB_TOKEN도 인식). device flow 대신 토큰을 직접 지정할 때 사용.",
     )
     parser.add_argument(
         "--client-id",
         metavar="CLIENT_ID",
         default=DEFAULT_CLIENT_ID,
         help=(
-            "GitHub OAuth App Client ID. device flow 인증(/auth) 사용 시 필수. "
+            "GitHub OAuth App Client ID (기본값: GitHub CLI 공개 앱). "
+            "직접 등록한 OAuth App을 사용하려면 이 값을 지정하세요. "
             "GitHub OAuth App 등록: https://github.com/settings/developers"
         ),
     )
@@ -827,17 +832,17 @@ def main():
     # 에이전트 초기화
     agent = AgentCore(github_token=args.token, client_id=args.client_id)
 
-    print("=" * 50)
+    print("=" * BANNER_WIDTH)
     print("  Sapiens2.0 AI Agent - 프로토타입 v1.0")
-    print("=" * 50)
+    print("=" * BANNER_WIDTH)
     print("  /help 를 입력하면 명령어 목록을 볼 수 있습니다.")
     if args.token:
         print("  ✅ GitHub 토큰이 설정되었습니다.")
     else:
-        print("  ℹ️  Copilot 연동을 위해 /auth 를 실행해 PAT 토큰을 입력하거나")
-        print("     --token <GITHUB_TOKEN> 옵션을 사용하세요.")
-        print("     PAT 생성: https://github.com/settings/tokens (Copilot 구독 필요)")
-    print("=" * 50)
+        print("  ℹ️  Copilot 연동을 시작하려면 /auth 를 입력하세요.")
+        print("     브라우저에서 https://github.com/login/device 에 접속해")
+        print("     터미널에 표시된 코드를 입력하면 자동으로 인증됩니다.")
+    print("=" * BANNER_WIDTH)
     print()
 
     # 대화 루프
