@@ -165,9 +165,8 @@ class MemoryModule:
     def add_message(self, role: str, content: str) -> None:
         """단기 기억(대화 내역)에 메시지를 추가합니다."""
         self._short_term.append({"role": role, "content": content})
-        # 너무 길어지면 오래된 메시지부터 제거
-        if len(self._short_term) > SHORT_TERM_MAX_MESSAGES:
-            self._short_term = self._short_term[-SHORT_TERM_MAX_MESSAGES:]
+        # 최대 메시지 수를 항상 유지
+        self._short_term = self._short_term[-SHORT_TERM_MAX_MESSAGES:]
 
     def get_short_term(self) -> List[Dict[str, str]]:
         """단기 기억(대화 내역)을 반환합니다."""
@@ -570,15 +569,32 @@ class CopilotModule:
         if not result:
             return {}
 
-        # JSON 파싱 (응답에서 JSON 객체 추출)
+        # JSON 파싱 - 중첩 객체도 처리하는 방식으로 추출
         try:
-            json_match = re.search(r"\{[^{}]*\}", result, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                if isinstance(data, dict):
-                    return {str(k): str(v) for k, v in data.items()}
-        except (json.JSONDecodeError, AttributeError):
+            # 전체 텍스트가 유효한 JSON인지 먼저 시도
+            data = json.loads(result.strip())
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except json.JSONDecodeError:
             pass
+
+        # 중괄호 깊이를 카운팅하여 첫 번째 완전한 JSON 객체 추출
+        start = result.find("{")
+        if start != -1:
+            depth = 0
+            for i, ch in enumerate(result[start:], start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            data = json.loads(result[start : i + 1])
+                            if isinstance(data, dict):
+                                return {str(k): str(v) for k, v in data.items()}
+                        except json.JSONDecodeError:
+                            pass
+                        break
         return {}
 
     def _call_copilot_api(self, system_prompt: str, user_message: str, max_tokens: int = 1024) -> Optional[str]:
