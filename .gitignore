@@ -24,3 +24,7 @@ ENV/
 # 환경 변수
 .env
 .env.local
+
+# Sapiens2.0 사용자 데이터 (세션별로 생성되는 파일)
+sapiens_memory.json
+sapiens_state.json

@@ -7,6 +7,8 @@ OpenClaw과 유사한 구조의 AI 에이전트 프로토타입입니다.
   1. PowerShell(터미널)에서 에이전트와 대화
   2. 파일 시스템 탐색·수정·실행 등 컴퓨터 통제
   3. 사용자의 GitHub Copilot 계정 연동 (코드 생성)
+  4. 단기/장기 기억 관리 (세션 대화 내역 + 지속 파일 저장)
+  5. Copilot 모델 선택 (/models), 새 대화 (/new), 전체 초기화 (/reset)
 
 사용법 (PowerShell):
   python .\\main.py                        # 실행 후 /auth 로 GitHub device 인증
@@ -15,6 +17,10 @@ OpenClaw과 유사한 구조의 AI 에이전트 프로토타입입니다.
 주요 명령어 (실행 후 입력):
   /auth                 GitHub device flow 인증 시작 (OpenClaw 방식, 권장)
   /auth <token>         GitHub PAT/OAuth 토큰 직접 입력
+  /models [번호|이름]   사용 가능한 Copilot 모델 목록 보기 / 모델 선택
+  /new                  새 대화 시작 (단기 기억 초기화, 장기 기억 유지)
+  /reset                전체 초기화 (장기 기억·모델 설정 포함, 확인 필요)
+  /memory               현재 장기 기억 내용 보기
   /pwd                  현재 작업 디렉토리 출력
   /ls [경로]            디렉토리 목록 출력
   /cat <파일>           파일 내용 출력
@@ -34,18 +40,24 @@ OpenClaw과 유사한 구조의 AI 에이전트 프로토타입입니다.
   5. GitHub 계정으로 승인
   6. 터미널에 ✅ 인증 성공 메시지 표시 후 Copilot 사용 가능
 
+기억 시스템:
+  - 단기 기억(short-term): 현재 세션 대화 내역. 세션 종료 또는 /new 시 초기화.
+  - 장기 기억(long-term): sapiens_memory.json 파일에 저장. 세션 간 유지.
+    에이전트가 대화 중 중요한 정보를 자동으로 추출하여 장기 기억에 저장합니다.
+
 의존성 (requirements.txt 참조):
   pip install requests
 """
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
 import json
 import textwrap
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 try:
     import requests
@@ -101,6 +113,128 @@ CONFIRM_REQUIRED_COMMANDS = {"rm", "del", "rmdir", "rd", "format", "mkfs", "dd"}
 # 시작 배너 너비
 BANNER_WIDTH = 54
 
+# 장기 기억 파일 경로 (프로젝트 폴더 기준)
+MEMORY_FILE = "sapiens_memory.json"
+
+# 에이전트 상태 파일 (선택된 모델 등 저장)
+STATE_FILE = "sapiens_state.json"
+
+# 단기 기억 최대 메시지 수 (초과 시 오래된 항목 제거)
+SHORT_TERM_MAX_MESSAGES = 20
+
+# 사용 가능한 Copilot 모델 목록 (API 조회 실패 시 기본값으로 사용)
+AVAILABLE_MODELS = [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-turbo",
+    "claude-3.5-sonnet",
+    "o1-preview",
+    "o1-mini",
+]
+
+# Copilot 모델 목록 API 엔드포인트
+COPILOT_MODELS_URL = "https://api.githubcopilot.com/models"
+
+
+# ─────────────────────────────────────────────
+#  모듈 0: 기억 관리 (단기/장기)
+# ─────────────────────────────────────────────
+
+class MemoryModule:
+    """
+    단기/장기 기억 모듈.
+
+    단기 기억(short-term):
+      - 현재 세션의 대화 내역 (role/content 메시지 리스트)
+      - 세션 종료 또는 /new 명령 시 초기화됨
+
+    장기 기억(long-term):
+      - sapiens_memory.json 파일에 JSON으로 저장
+      - 세션 간 유지, /reset 시에만 삭제
+      - 에이전트가 대화에서 중요한 정보를 자동 추출하여 업데이트
+    """
+
+    def __init__(self, memory_file: str = MEMORY_FILE):
+        self._memory_file = memory_file
+        self._long_term: Dict[str, str] = {}
+        self._short_term: List[Dict[str, str]] = []
+        self._load()
+
+    # ── 단기 기억 ──────────────────────────────
+
+    def add_message(self, role: str, content: str) -> None:
+        """단기 기억(대화 내역)에 메시지를 추가합니다."""
+        self._short_term.append({"role": role, "content": content})
+        # 너무 길어지면 오래된 메시지부터 제거
+        if len(self._short_term) > SHORT_TERM_MAX_MESSAGES:
+            self._short_term = self._short_term[-SHORT_TERM_MAX_MESSAGES:]
+
+    def get_short_term(self) -> List[Dict[str, str]]:
+        """단기 기억(대화 내역)을 반환합니다."""
+        return list(self._short_term)
+
+    def clear_short_term(self) -> None:
+        """단기 기억(세션 대화)을 초기화합니다."""
+        self._short_term = []
+
+    # ── 장기 기억 ──────────────────────────────
+
+    def _load(self) -> None:
+        """장기 기억 파일을 로드합니다."""
+        if os.path.exists(self._memory_file):
+            try:
+                with open(self._memory_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self._long_term = {str(k): str(v) for k, v in data.items()}
+            except (json.JSONDecodeError, IOError):
+                self._long_term = {}
+
+    def _save(self) -> None:
+        """장기 기억을 파일에 저장합니다."""
+        try:
+            with open(self._memory_file, "w", encoding="utf-8") as f:
+                json.dump(self._long_term, f, ensure_ascii=False, indent=2)
+        except IOError as e:
+            print(f"[메모리] 장기 기억 저장 실패: {e}")
+
+    def update_long_term(self, updates: Dict[str, str]) -> None:
+        """장기 기억을 업데이트하고 파일에 저장합니다."""
+        if updates:
+            self._long_term.update({str(k): str(v) for k, v in updates.items()})
+            self._save()
+
+    def get_long_term(self) -> Dict[str, str]:
+        """장기 기억 전체를 반환합니다."""
+        return dict(self._long_term)
+
+    def get_long_term_context(self) -> str:
+        """장기 기억을 시스템 프롬프트에 포함할 텍스트 형태로 반환합니다."""
+        if not self._long_term:
+            return ""
+        parts = ["[에이전트 장기 기억 — 이전 세션에서 기억된 정보]"]
+        for key, value in self._long_term.items():
+            parts.append(f"  - {key}: {value}")
+        return "\n".join(parts)
+
+    def clear_long_term(self) -> None:
+        """장기 기억을 초기화하고 파일을 삭제합니다."""
+        self._long_term = {}
+        if os.path.exists(self._memory_file):
+            try:
+                os.remove(self._memory_file)
+            except OSError:
+                pass
+
+    def get_display(self) -> str:
+        """장기 기억을 사람이 읽기 쉬운 형태로 반환합니다."""
+        if not self._long_term:
+            return "(장기 기억 없음)"
+        lines = []
+        for key, value in self._long_term.items():
+            lines.append(f"  • {key}: {value}")
+        return "\n".join(lines)
+
 
 # ─────────────────────────────────────────────
 #  모듈 1: GitHub Copilot 연동
@@ -123,6 +257,51 @@ class CopilotModule:
         self._github_token: Optional[str] = None   # GitHub OAuth/PAT 토큰
         self._copilot_token: Optional[str] = None  # Copilot API 토큰 (만료 30분)
         self._copilot_token_expires: float = 0  # 만료 시각 (epoch seconds)
+        self._model: str = COPILOT_DEFAULT_MODEL  # 선택된 모델
+
+    # ── 모델 선택 ──────────────────────────────
+
+    def set_model(self, model: str) -> None:
+        """사용할 Copilot 모델을 설정합니다."""
+        self._model = model
+
+    def get_model(self) -> str:
+        """현재 선택된 모델명을 반환합니다."""
+        return self._model
+
+    def list_models(self) -> List[str]:
+        """
+        사용 가능한 Copilot 모델 목록을 반환합니다.
+        인증된 상태면 API에서 조회하고, 실패 시 기본 목록을 반환합니다.
+        """
+        copilot_token = self._get_copilot_token()
+        if copilot_token:
+            try:
+                resp = requests.get(
+                    COPILOT_MODELS_URL,
+                    headers={
+                        "Authorization": f"Bearer {copilot_token}",
+                        "Accept": "application/json",
+                        "Editor-Version": _EDITOR_VERSION,
+                        "Editor-Plugin-Version": _PLUGIN_VERSION,
+                        "User-Agent": _USER_AGENT,
+                        "X-GitHub-Api-Version": _GH_CHAT_API_VERSION,
+                    },
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = [
+                        m.get("id", "") if isinstance(m, dict) else str(m)
+                        for m in data.get("data", [])
+                    ]
+                    models = [m for m in models if m]
+                    if models:
+                        return models
+            except requests.RequestException:
+                pass
+
+        return list(AVAILABLE_MODELS)
 
     # ── 토큰 설정 ──────────────────────────────
 
@@ -151,6 +330,8 @@ class CopilotModule:
             lines.append("  Copilot 토큰 : ℹ️  첫 메시지 입력 시 자동 교환됩니다")
         else:
             lines.append("  Copilot 토큰 : ❌ 미교환")
+
+        lines.append(f"  선택된 모델  : {self._model}")
 
         return "\n" + "\n".join(lines)
 
@@ -324,35 +505,114 @@ class CopilotModule:
         )
         return self._call_copilot_api(system_msg, prompt)
 
-    def chat(self, message: str) -> Optional[str]:
+    def chat(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        long_term_context: str = "",
+    ) -> Optional[str]:
         """
         Copilot과 자연어 대화를 수행합니다.
+        단기 기억(conversation history)과 장기 기억 컨텍스트를 포함합니다.
 
         Args:
             message: 사용자 메시지
+            history: 이전 대화 내역 (단기 기억)
+            long_term_context: 장기 기억 텍스트
 
         Returns:
             Copilot의 응답 문자열 또는 None (실패 시)
         """
-        system_msg = (
+        system_parts = [
             "You are Sapiens2.0, a helpful AI agent assistant. "
             "Answer concisely in the same language the user writes in."
-        )
-        return self._call_copilot_api(system_msg, message)
+        ]
+        if long_term_context:
+            system_parts.append(long_term_context)
 
-    def _call_copilot_api(self, system_prompt: str, user_message: str) -> Optional[str]:
-        """Copilot Chat Completions API를 호출합니다."""
+        system_msg = "\n\n".join(system_parts)
+
+        messages: List[Dict[str, str]] = []
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": message})
+
+        return self._call_copilot_api_messages(system_msg, messages)
+
+    def extract_memory_updates(self, user_msg: str, assistant_response: str) -> Dict[str, str]:
+        """
+        대화 교환에서 장기 기억으로 저장할 중요한 정보를 추출합니다.
+        모델이 직접 기억 파일을 관리하는 핵심 메서드입니다.
+
+        Args:
+            user_msg: 사용자 메시지
+            assistant_response: 에이전트 응답
+
+        Returns:
+            장기 기억에 추가/갱신할 키-값 쌍 딕셔너리 (없으면 빈 딕셔너리)
+        """
+        system_prompt = (
+            "You are a memory manager for an AI agent called Sapiens2.0. "
+            "Given a conversation exchange, extract important facts worth remembering long-term. "
+            "Respond ONLY with a valid JSON object where keys are short descriptive labels "
+            "and values are concise facts. "
+            "If there is nothing important to remember, respond with exactly: {} "
+            "Focus on: user preferences, important context, facts about the user, key topics. "
+            "Keep entries concise. Max 5 new entries per exchange."
+        )
+        prompt = (
+            f"User: {user_msg}\n"
+            f"Assistant: {assistant_response}\n\n"
+            "Extract memorable facts as a JSON object:"
+        )
+
+        result = self._call_copilot_api(system_prompt, prompt, max_tokens=256)
+        if not result:
+            return {}
+
+        # JSON 파싱 (응답에서 JSON 객체 추출)
+        try:
+            json_match = re.search(r"\{[^{}]*\}", result, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items()}
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        return {}
+
+    def _call_copilot_api(self, system_prompt: str, user_message: str, max_tokens: int = 1024) -> Optional[str]:
+        """단일 사용자 메시지로 Copilot Chat Completions API를 호출합니다."""
+        messages = [{"role": "user", "content": user_message}]
+        return self._call_copilot_api_messages(system_prompt, messages, max_tokens=max_tokens)
+
+    def _call_copilot_api_messages(
+        self,
+        system_prompt: str,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 1024,
+    ) -> Optional[str]:
+        """
+        대화 내역(messages 리스트)을 포함하여 Copilot Chat Completions API를 호출합니다.
+
+        Args:
+            system_prompt: 시스템 프롬프트
+            messages: 대화 메시지 리스트 [{role, content}, ...]
+            max_tokens: 최대 토큰 수
+
+        Returns:
+            응답 텍스트 또는 None (실패 시)
+        """
         copilot_token = self._get_copilot_token()
         if not copilot_token:
             return None
 
+        all_messages = [{"role": "system", "content": system_prompt}] + messages
+
         payload = {
-            "model": COPILOT_DEFAULT_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            "max_tokens": 1024,
+            "model": self._model,
+            "messages": all_messages,
+            "max_tokens": max_tokens,
             "temperature": 0.2,
         }
 
@@ -607,16 +867,52 @@ class AgentCore:
     """
     Sapiens2.0 에이전트 핵심 모듈.
 
-    사용자 입력을 분석하여 적절한 모듈(Copilot, System)로 라우팅합니다.
+    사용자 입력을 분석하여 적절한 모듈(Copilot, System, Memory)로 라우팅합니다.
+
+    기억 구조:
+      - 단기 기억: MemoryModule._short_term (세션 대화 내역)
+      - 장기 기억: sapiens_memory.json (세션 간 지속)
+
+    상태 파일:
+      - sapiens_state.json: 선택된 모델 등 에이전트 상태 저장
     """
 
     def __init__(self, github_token: Optional[str] = None, client_id: str = DEFAULT_CLIENT_ID):
         self.copilot = CopilotModule()
         self.system = SystemCommandModule()
+        self.memory = MemoryModule()
         self.client_id = client_id
+
+        # 저장된 상태(모델 선택 등) 불러오기
+        self._load_state()
 
         if github_token:
             self.copilot.set_token(github_token)
+
+    # ── 상태 관리 ──────────────────────────────
+
+    def _load_state(self) -> None:
+        """에이전트 상태 파일에서 설정을 불러옵니다."""
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                if isinstance(state, dict):
+                    model = state.get("model", COPILOT_DEFAULT_MODEL)
+                    self.copilot.set_model(model)
+            except (json.JSONDecodeError, IOError):
+                pass
+
+    def _save_state(self) -> None:
+        """현재 에이전트 상태를 파일에 저장합니다."""
+        try:
+            state = {"model": self.copilot.get_model()}
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except IOError as e:
+            print(f"[상태] 상태 저장 실패: {e}")
+
+    # ── 입력 처리 ──────────────────────────────
 
     def process(self, user_input: str) -> str:
         """
@@ -649,8 +945,31 @@ class AgentCore:
                 "  슬래시 명령(/pwd, /ls, /help 등)은 인증 없이 사용 가능합니다."
             )
 
-        response = self.copilot.chat(raw)
-        return response if response else "[오류] Copilot 응답을 받지 못했습니다."
+        # 장기 기억 컨텍스트와 단기 기억(대화 내역)을 포함하여 채팅
+        lt_context = self.memory.get_long_term_context()
+        history = self.memory.get_short_term()
+
+        # 사용자 메시지를 단기 기억에 추가
+        self.memory.add_message("user", raw)
+
+        response = self.copilot.chat(raw, history=history, long_term_context=lt_context)
+        if response:
+            # 응답을 단기 기억에 추가
+            self.memory.add_message("assistant", response)
+            # 대화에서 중요한 정보를 추출하여 장기 기억 업데이트 (비동기적으로 수행)
+            self._try_update_long_term_memory(raw, response)
+            return response
+
+        return "[오류] Copilot 응답을 받지 못했습니다."
+
+    def _try_update_long_term_memory(self, user_msg: str, assistant_response: str) -> None:
+        """대화에서 중요한 정보를 추출해 장기 기억을 업데이트합니다."""
+        try:
+            updates = self.copilot.extract_memory_updates(user_msg, assistant_response)
+            if updates:
+                self.memory.update_long_term(updates)
+        except Exception:
+            pass  # 장기 기억 업데이트 실패 시 무시
 
     def _handle_slash_command(self, raw: str) -> str:
         """슬래시(/) 명령을 파싱하고 실행합니다."""
@@ -673,6 +992,71 @@ class AgentCore:
         # ── 인증 상태 확인 ───────────────────────
         if cmd == "/status":
             return self.copilot.get_status()
+
+        # ── 모델 선택 ────────────────────────────
+        if cmd == "/models":
+            models = self.copilot.list_models()
+            current = self.copilot.get_model()
+
+            if arg1:
+                # 번호 또는 이름으로 모델 선택
+                try:
+                    idx = int(arg1) - 1
+                    if 0 <= idx < len(models):
+                        selected = models[idx]
+                        self.copilot.set_model(selected)
+                        self._save_state()
+                        return f"✅ 모델이 '{selected}'으로 변경되었습니다."
+                    return f"[오류] 유효하지 않은 번호입니다. 1~{len(models)} 사이로 입력하세요."
+                except ValueError:
+                    # 이름으로 선택
+                    if arg1 in models:
+                        self.copilot.set_model(arg1)
+                        self._save_state()
+                        return f"✅ 모델이 '{arg1}'으로 변경되었습니다."
+                    return f"[오류] 모델을 찾을 수 없습니다: {arg1}\n/models 로 목록을 확인하세요."
+
+            # 모델 목록 출력
+            lines = ["사용 가능한 Copilot 모델:"]
+            for i, model in enumerate(models, 1):
+                marker = " ◀ 현재 선택" if model == current else ""
+                lines.append(f"  {i}. {model}{marker}")
+            lines.append(f"\n선택하려면: /models <번호 또는 모델명>")
+            if not self.copilot.is_authenticated():
+                lines.append("  (인증 후에는 API에서 실제 지원 모델을 조회합니다)")
+            return "\n".join(lines)
+
+        # ── 새 대화 ──────────────────────────────
+        if cmd == "/new":
+            self.memory.clear_short_term()
+            return "🆕 새 대화를 시작합니다. (단기 기억 초기화됨, 장기 기억은 유지됩니다)"
+
+        # ── 전체 초기화 ──────────────────────────
+        if cmd == "/reset":
+            if not _confirm(
+                "⚠️  모든 장기 기억, 현재 대화, 모델 설정이 초기화됩니다. 계속하겠습니까?"
+            ):
+                return "취소되었습니다."
+            self.memory.clear_short_term()
+            self.memory.clear_long_term()
+            self.copilot.set_model(COPILOT_DEFAULT_MODEL)
+            # 상태 파일 삭제
+            if os.path.exists(STATE_FILE):
+                try:
+                    os.remove(STATE_FILE)
+                except OSError:
+                    pass
+            return (
+                "✅ 초기화 완료!\n"
+                f"  - 장기 기억(sapiens_memory.json) 삭제\n"
+                f"  - 대화 내역(단기 기억) 초기화\n"
+                f"  - 모델이 '{COPILOT_DEFAULT_MODEL}'으로 초기화됨"
+            )
+
+        # ── 장기 기억 확인 ───────────────────────
+        if cmd == "/memory":
+            display = self.memory.get_display()
+            return f"[장기 기억]\n{display}"
 
         # ── 파일 시스템 ─────────────────────────
         if cmd == "/pwd":
@@ -835,7 +1219,17 @@ def _help_text() -> str:
                                → 터미널에 표시된 코드를 확인하고
                                  https://github.com/login/device 에서 입력
           /auth <token>        GitHub PAT/OAuth 토큰 직접 설정
-          /status              현재 GitHub/Copilot 인증 상태 확인
+          /status              현재 GitHub/Copilot 인증 상태 및 선택 모델 확인
+
+        [모델 선택]
+          /models              사용 가능한 Copilot 모델 목록 출력
+          /models <번호>       번호로 모델 선택 (예: /models 2)
+          /models <이름>       모델명으로 선택 (예: /models gpt-4o-mini)
+
+        [대화 / 기억]
+          /new                 새 대화 시작 (단기 기억 초기화, 장기 기억 유지)
+          /reset               전체 초기화 (장기 기억·모델 설정 포함, 확인 필요)
+          /memory              현재 장기 기억 내용 출력
 
         [파일 시스템]
           /pwd                 현재 작업 디렉토리 출력
@@ -857,7 +1251,12 @@ def _help_text() -> str:
           /exit  또는  /quit   프로그램 종료
 
         슬래시 명령 외 일반 텍스트 입력은 Copilot과의 대화로 처리됩니다.
-        (Copilot 인증 필요)
+        (Copilot 인증 필요 / 대화 내역은 단기 기억으로 자동 유지됨)
+
+        [기억 구조]
+          단기 기억 : 현재 세션 대화 내역. /new 또는 세션 종료 시 초기화.
+          장기 기억 : sapiens_memory.json 파일에 저장. 세션 간 유지.
+                     에이전트가 대화 중 중요한 정보를 자동으로 장기 기억에 저장합니다.
 
         [PowerShell 실행 예시]
           python .\\main.py
@@ -917,7 +1316,7 @@ def main():
     agent = AgentCore(github_token=args.token, client_id=args.client_id)
 
     print("=" * BANNER_WIDTH)
-    print("  Sapiens2.0 AI Agent - 프로토타입 v1.0")
+    print("  Sapiens2.0 AI Agent - 프로토타입 v2.0")
     print("=" * BANNER_WIDTH)
     print("  /help 를 입력하면 명령어 목록을 볼 수 있습니다.")
     if args.token:
@@ -926,6 +1325,10 @@ def main():
         print("  ℹ️  Copilot 연동을 시작하려면 /auth 를 입력하세요.")
         print("     브라우저에서 https://github.com/login/device 에 접속해")
         print("     터미널에 표시된 코드를 입력하면 자동으로 인증됩니다.")
+    lt_mem = agent.memory.get_long_term()
+    if lt_mem:
+        print(f"  💾 장기 기억 {len(lt_mem)}개 항목이 로드되었습니다. (/memory 로 확인)")
+    print(f"  🤖 선택된 모델: {agent.copilot.get_model()} (/models 로 변경)")
     print("=" * BANNER_WIDTH)
     print()
 
