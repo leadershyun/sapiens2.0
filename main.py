@@ -86,7 +86,13 @@ COPILOT_TOKEN_LIFETIME_SECONDS = 1800
 _EDITOR_VERSION = "vscode/1.95.0"
 _PLUGIN_VERSION = "copilot-chat/0.22.3"
 _USER_AGENT = "GitHubCopilotChat/0.22.3"
+# copilot_internal/v2/token 엔드포인트의 GitHub API 버전
 _GH_API_VERSION = "2022-11-28"
+# Copilot Chat Completions API의 GitHub API 버전 (엔드포인트별로 버전이 다릅니다)
+_GH_CHAT_API_VERSION = "2023-07-07"
+
+# Copilot 토큰 갱신 시 만료까지 이 초 이하로 남으면 미리 갱신합니다.
+COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS = 60
 
 # 위험 작업 목록 (실행 전 사용자 확인 요청)
 DANGEROUS_EXTENSIONS = {".sh", ".bat", ".cmd", ".ps1", ".exe"}
@@ -138,7 +144,7 @@ class CopilotModule:
         else:
             lines.append("  GitHub 토큰  : ❌ 미설정 (/auth 로 인증하세요)")
 
-        if self._copilot_token and time.time() < self._copilot_token_expires - 60:
+        if self._copilot_token and time.time() < self._copilot_token_expires - COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS:
             remaining = int(self._copilot_token_expires - time.time())
             lines.append(f"  Copilot 토큰 : ✅ 유효 (약 {remaining}초 남음)")
         elif self._github_token:
@@ -247,7 +253,7 @@ class CopilotModule:
             return None
 
         # 토큰이 유효하면 재사용
-        if self._copilot_token and time.time() < self._copilot_token_expires - 60:
+        if self._copilot_token and time.time() < self._copilot_token_expires - COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS:
             return self._copilot_token
 
         try:
@@ -361,7 +367,7 @@ class CopilotModule:
                     "Editor-Version": _EDITOR_VERSION,
                     "Editor-Plugin-Version": _PLUGIN_VERSION,
                     "User-Agent": _USER_AGENT,
-                    "X-GitHub-Api-Version": "2023-07-07",
+                    "X-GitHub-Api-Version": _GH_CHAT_API_VERSION,
                     "openai-intent": "conversation-panel",
                 },
                 json=payload,
