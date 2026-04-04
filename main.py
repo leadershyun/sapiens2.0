@@ -607,7 +607,7 @@ class AgentCore:
                 return "[오류] 사용법: /write <파일> <내용>"
             content = arg2
             if not content:
-                print(f"  '{arg1}'에 작성할 내용을 입력하세요 (빈 줄에서 Ctrl+D 또는 'EOF'로 종료):")
+                print(f"  '{arg1}'에 작성할 내용을 입력하세요 (Windows: Ctrl+Z+Enter, Unix: Ctrl+D 또는 'EOF'로 종료):")
                 lines = []
                 try:
                     while True:
@@ -689,7 +689,7 @@ def _confirm(message: str) -> bool:
     """
     try:
         answer = input(f"{message} [y/N] ").strip().lower()
-        return answer in ("y", "yes", "예", "ㅇ")
+        return answer in ("y", "yes", "예", "응")
     except (EOFError, KeyboardInterrupt):
         return False
 
