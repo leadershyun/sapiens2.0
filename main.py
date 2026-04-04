@@ -71,11 +71,28 @@ COPILOT_CHAT_URL = "https://api.githubcopilot.com/chat/completions"
 GH_DEVICE_CODE_URL = "https://github.com/login/device/code"
 GH_TOKEN_URL = "https://github.com/login/oauth/access_token"
 
+# GitHub device flow에서 요청하는 OAuth 스코프.
+# Copilot 토큰 교환을 위해 read:user 외에 추가 스코프가 필요합니다.
+GH_DEVICE_FLOW_SCOPE = "read:user copilot"
+
 # Copilot API 기본 모델 (환경에 따라 변경 가능)
 COPILOT_DEFAULT_MODEL = "gpt-4o"
 
 # Copilot API 토큰 유효 시간 (초). Copilot 토큰은 약 30분간 유효합니다.
 COPILOT_TOKEN_LIFETIME_SECONDS = 1800
+
+# Copilot API 호출 시 사용하는 에디터 식별 헤더.
+# GitHub Copilot 내부 API는 호출자 식별을 위해 이 헤더들을 요구합니다.
+_EDITOR_VERSION = "vscode/1.95.0"
+_PLUGIN_VERSION = "copilot-chat/0.22.3"
+_USER_AGENT = "GitHubCopilotChat/0.22.3"
+# copilot_internal/v2/token 엔드포인트의 GitHub API 버전
+_GH_API_VERSION = "2022-11-28"
+# Copilot Chat Completions API의 GitHub API 버전 (엔드포인트별로 버전이 다릅니다)
+_GH_CHAT_API_VERSION = "2023-07-07"
+
+# Copilot 토큰 갱신 시 만료까지 이 초 이하로 남으면 미리 갱신합니다.
+COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS = 60
 
 # 위험 작업 목록 (실행 전 사용자 확인 요청)
 DANGEROUS_EXTENSIONS = {".sh", ".bat", ".cmd", ".ps1", ".exe"}
@@ -119,6 +136,24 @@ class CopilotModule:
         """GitHub 토큰이 설정되어 있는지 확인합니다."""
         return bool(self._github_token)
 
+    def get_status(self) -> str:
+        """현재 인증 및 Copilot 토큰 상태를 반환합니다."""
+        lines = []
+        if self._github_token:
+            lines.append("  GitHub 토큰  : ✅ 설정됨")
+        else:
+            lines.append("  GitHub 토큰  : ❌ 미설정 (/auth 로 인증하세요)")
+
+        if self._copilot_token and time.time() < self._copilot_token_expires - COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS:
+            remaining = int(self._copilot_token_expires - time.time())
+            lines.append(f"  Copilot 토큰 : ✅ 유효 (약 {remaining}초 남음)")
+        elif self._github_token:
+            lines.append("  Copilot 토큰 : ℹ️  첫 메시지 입력 시 자동 교환됩니다")
+        else:
+            lines.append("  Copilot 토큰 : ❌ 미교환")
+
+        return "\n" + "\n".join(lines)
+
     # ── Device Flow 인증 ───────────────────────
 
     def authenticate_device_flow(self, client_id: str = DEFAULT_CLIENT_ID) -> bool:
@@ -139,7 +174,7 @@ class CopilotModule:
             resp = requests.post(
                 GH_DEVICE_CODE_URL,
                 headers={"Accept": "application/json"},
-                data={"client_id": client_id, "scope": "read:user"},
+                data={"client_id": client_id, "scope": GH_DEVICE_FLOW_SCOPE},
                 timeout=10,
             )
             resp.raise_for_status()
@@ -188,6 +223,7 @@ class CopilotModule:
                 self._github_token = poll_data["access_token"]
                 self._copilot_token = None
                 print("[Copilot] ✅ GitHub 인증 성공!")
+                print("[Copilot] ℹ️  첫 메시지 입력 시 Copilot 구독 확인 및 토큰 교환을 시도합니다.")
                 return True
 
             error = poll_data.get("error", "")
@@ -217,7 +253,7 @@ class CopilotModule:
             return None
 
         # 토큰이 유효하면 재사용
-        if self._copilot_token and time.time() < self._copilot_token_expires - 60:
+        if self._copilot_token and time.time() < self._copilot_token_expires - COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS:
             return self._copilot_token
 
         try:
@@ -226,6 +262,10 @@ class CopilotModule:
                 headers={
                     "Authorization": f"token {self._github_token}",
                     "Accept": "application/json",
+                    "Editor-Version": _EDITOR_VERSION,
+                    "Editor-Plugin-Version": _PLUGIN_VERSION,
+                    "User-Agent": _USER_AGENT,
+                    "X-GitHub-Api-Version": _GH_API_VERSION,
                 },
                 timeout=10,
             )
@@ -233,14 +273,27 @@ class CopilotModule:
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
             if status == 401:
-                print("[Copilot 오류] GitHub 토큰이 유효하지 않습니다. 다시 /auth 를 실행하세요.")
+                print("[Copilot 오류] GitHub 토큰이 유효하지 않거나 만료되었습니다. 다시 /auth 를 실행하세요.")
             elif status == 403:
-                print("[Copilot 오류] GitHub Copilot 접근 권한이 없습니다. Copilot 구독을 확인하세요.")
+                print(
+                    "[Copilot 오류] GitHub Copilot 토큰 교환이 거부되었습니다 (HTTP 403).\n"
+                    "  원인 1: 이 GitHub 계정에 활성 Copilot 구독이 없습니다.\n"
+                    "           → https://github.com/settings/copilot 에서 구독 상태를 확인하세요.\n"
+                    "  원인 2: 인증 시 요청한 OAuth 스코프가 부족합니다.\n"
+                    "           → /auth 를 다시 실행하여 새 토큰을 발급받으세요.\n"
+                    "  원인 3: 조직 SSO 정책으로 인해 토큰이 차단되었을 수 있습니다.\n"
+                    "           → GitHub SSO 승인 페이지에서 이 앱을 승인하세요."
+                )
+            elif status == 404:
+                print(
+                    "[Copilot 오류] Copilot 토큰 교환 엔드포인트를 찾을 수 없습니다 (HTTP 404).\n"
+                    "  GitHub Copilot 내부 API 주소가 변경되었을 수 있습니다."
+                )
             else:
                 print(f"[Copilot 오류] Copilot 토큰 교환 실패 (HTTP {status}): {e}")
             return None
         except requests.RequestException as e:
-            print(f"[Copilot 오류] 네트워크 오류: {e}")
+            print(f"[Copilot 오류] 네트워크 오류 (Copilot 토큰 교환): {e}")
             return None
 
         token_data = resp.json()
@@ -309,9 +362,13 @@ class CopilotModule:
                 headers={
                     "Authorization": f"Bearer {copilot_token}",
                     "Content-Type": "application/json",
-                    "Copilot-Integration-Id": "sapiens2.0",
-                    "Editor-Version": "Sapiens2.0/1.0",
-                    "Editor-Plugin-Version": "sapiens2.0/1.0",
+                    "Accept": "application/json",
+                    "Copilot-Integration-Id": "vscode-chat",
+                    "Editor-Version": _EDITOR_VERSION,
+                    "Editor-Plugin-Version": _PLUGIN_VERSION,
+                    "User-Agent": _USER_AGENT,
+                    "X-GitHub-Api-Version": _GH_CHAT_API_VERSION,
+                    "openai-intent": "conversation-panel",
                 },
                 json=payload,
                 timeout=30,
@@ -319,10 +376,32 @@ class CopilotModule:
             resp.raise_for_status()
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
-            print(f"[Copilot 오류] API 호출 실패 (HTTP {status}): {e}")
+            if status == 401:
+                print(
+                    "[Copilot 오류] Copilot API 인증 실패 (HTTP 401). Copilot 토큰이 만료되었습니다.\n"
+                    "  다음 요청 시 자동으로 토큰을 갱신합니다. 문제가 반복되면 /auth 를 다시 실행하세요."
+                )
+                self._copilot_token = None  # 만료된 토큰 초기화
+            elif status == 403:
+                print(
+                    "[Copilot 오류] Copilot API 접근 거부 (HTTP 403).\n"
+                    "  Copilot 구독 상태를 확인하세요: https://github.com/settings/copilot"
+                )
+            elif status == 404:
+                print(
+                    "[Copilot 오류] Copilot Chat API 엔드포인트를 찾을 수 없습니다 (HTTP 404).\n"
+                    "  요청 모델명 또는 API 주소가 올바른지 확인하세요."
+                )
+            elif status == 422:
+                print(
+                    "[Copilot 오류] 요청 형식이 잘못되었습니다 (HTTP 422).\n"
+                    "  모델명이나 요청 파라미터를 확인하세요."
+                )
+            else:
+                print(f"[Copilot 오류] Copilot Chat API 호출 실패 (HTTP {status}): {e}")
             return None
         except requests.RequestException as e:
-            print(f"[Copilot 오류] 네트워크 오류: {e}")
+            print(f"[Copilot 오류] 네트워크 오류 (Chat API): {e}")
             return None
 
         try:
@@ -591,6 +670,10 @@ class AgentCore:
                 ok = self.copilot.authenticate_device_flow(self.client_id)
                 return "✅ 인증 완료!" if ok else "❌ 인증 실패. 다시 시도하세요."
 
+        # ── 인증 상태 확인 ───────────────────────
+        if cmd == "/status":
+            return self.copilot.get_status()
+
         # ── 파일 시스템 ─────────────────────────
         if cmd == "/pwd":
             return f"현재 폴더: {self.system.get_cwd()}"
@@ -752,6 +835,7 @@ def _help_text() -> str:
                                → 터미널에 표시된 코드를 확인하고
                                  https://github.com/login/device 에서 입력
           /auth <token>        GitHub PAT/OAuth 토큰 직접 설정
+          /status              현재 GitHub/Copilot 인증 상태 확인
 
         [파일 시스템]
           /pwd                 현재 작업 디렉토리 출력

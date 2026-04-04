@@ -81,6 +81,7 @@ python .\main.py
 |--------|------|
 | `/auth` | GitHub device flow 인증 시작 (OpenClaw 방식, **권장**) |
 | `/auth <token>` | GitHub PAT/OAuth 토큰 직접 입력 |
+| `/status` | 현재 GitHub/Copilot 인증 상태 확인 |
 | `/pwd` | 현재 디렉토리 출력 |
 | `/ls [경로]` | 디렉토리 목록 출력 |
 | `/cat <파일>` | 파일 내용 출력 |
@@ -93,6 +94,31 @@ python .\main.py
 | `/exit` | 종료 |
 
 일반 텍스트 입력은 Copilot과의 대화로 처리됩니다 (인증 필요).
+
+## 문제 해결 (Troubleshooting)
+
+### GitHub 인증은 성공했지만 Copilot 응답이 실패하는 경우
+
+인증 후 메시지를 보냈을 때 오류가 나면, `/status` 명령으로 상태를 먼저 확인하세요.
+
+```text
+[사용자] /status
+```
+
+오류 유형별 해결 방법:
+
+| 오류 메시지 | 원인 | 해결 방법 |
+|------------|------|-----------|
+| `Copilot 토큰 교환이 거부되었습니다 (HTTP 403)` | Copilot 구독 없음 또는 OAuth 스코프 부족 | https://github.com/settings/copilot 구독 확인 후 `/auth` 재실행 |
+| `GitHub 토큰이 유효하지 않거나 만료되었습니다 (HTTP 401)` | GitHub 토큰 만료 | `/auth` 재실행 |
+| `Copilot Chat API 엔드포인트를 찾을 수 없습니다 (HTTP 404)` | API 주소 또는 모델명 오류 | 최신 버전 코드 확인 |
+| `조직 SSO 정책으로 인해 토큰이 차단` | 조직 SSO 미승인 | GitHub SSO 승인 페이지에서 앱 승인 |
+
+### 공통 확인 사항
+
+1. GitHub 계정에 활성 Copilot 구독이 있는지 확인: https://github.com/settings/copilot
+2. `/auth` 명령 실행 후 브라우저에서 코드를 정확히 입력했는지 확인
+3. 인증 후 바로 `/status` 명령으로 토큰 상태 확인
 
 ## 고급: 직접 OAuth App 사용
 
