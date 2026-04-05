@@ -156,10 +156,16 @@ TOOL_CALL_RE = re.compile(r'<tool>(.*?)</tool>', re.DOTALL | re.IGNORECASE)
 # ─────────────────────────────────────────────
 
 def _save_auth_token(token: str) -> None:
-    """Save GitHub token to ~/.sapiens2/config.json for persistence across runs."""
+    """Save GitHub token to ~/.sapiens2/config.json for persistence across runs.
+    The file is created with owner-only read/write permissions (0o600).
+    """
     try:
         os.makedirs(AUTH_CONFIG_DIR, exist_ok=True)
-        with open(AUTH_CONFIG_FILE, "w", encoding="utf-8") as f:
+        # Use os.open to enforce restrictive permissions from creation time,
+        # preventing other OS users from reading the OAuth token.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(AUTH_CONFIG_FILE, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"github_token": token}, f)
     except IOError:
         pass  # Non-fatal: session will still work without persistence
@@ -1057,7 +1063,7 @@ class AgentCore:
 
         last_response = ""
 
-        for _iteration in range(5):  # max 5 tool-call iterations per turn
+        for _turn in range(5):  # max 5 tool-call iterations per turn
             response = self.copilot._call_copilot_api_messages(
                 system_prompt, messages, max_tokens=2048
             )

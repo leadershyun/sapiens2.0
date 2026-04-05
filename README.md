@@ -183,6 +183,11 @@ The selected model is saved in `sapiens_state.json` and persists across sessions
 
 `sapiens_memory.json` and `sapiens_state.json` are in `.gitignore`.
 
+> **Security note:** `~/.sapiens2/config.json` stores your GitHub OAuth token and is created
+> with owner-only read/write permissions (`0o600` on Unix/macOS). On Windows, access is
+> controlled by NTFS user permissions on your home directory. Do not share this file.
+> Run `/logout` to remove it at any time.
+
 ## Troubleshooting
 
 ### Authentication succeeded but Copilot fails
