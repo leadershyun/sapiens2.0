@@ -1,51 +1,61 @@
 """
-Sapiens2.0 - AI Agent Prototype
-================================
-OpenClaw과 유사한 구조의 AI 에이전트 프로토타입입니다.
+Sapiens2.0 - AI Agent
+======================
+An AI agent prototype with computer control, long-term memory, and GitHub Copilot integration.
 
-기능:
-  1. PowerShell(터미널)에서 에이전트와 대화
-  2. 파일 시스템 탐색·수정·실행 등 컴퓨터 통제
-  3. 사용자의 GitHub Copilot 계정 연동 (코드 생성)
-  4. 단기/장기 기억 관리 (세션 대화 내역 + 지속 파일 저장)
-  5. Copilot 모델 선택 (/models), 새 대화 (/new), 전체 초기화 (/reset)
+Features:
+  1. Conversational AI powered by GitHub Copilot
+  2. Computer control: inspect files, navigate directories, create/edit files, run commands
+  3. Short-term memory (session) and long-term memory (persistent file)
+  4. Model selection (/models), new conversation (/new), full reset (/reset)
+  5. Persistent GitHub account linkage across runs
 
-사용법 (PowerShell):
-  python .\\main.py                        # 실행 후 /auth 로 GitHub device 인증
-  python .\\main.py --token <GITHUB_TOKEN> # GitHub PAT/OAuth 토큰 직접 지정
+Installation & Usage:
+  pip install -e .         # Install once — makes 'sapiens' command available globally
+  sapiens wakeup           # Start Sapiens2.0 from any directory
 
-주요 명령어 (실행 후 입력):
-  /auth                 GitHub device flow 인증 시작 (OpenClaw 방식, 권장)
-  /auth <token>         GitHub PAT/OAuth 토큰 직접 입력
-  /models [번호|이름]   사용 가능한 Copilot 모델 목록 보기 / 모델 선택
-  /new                  새 대화 시작 (단기 기억 초기화, 장기 기억 유지)
-  /reset                전체 초기화 (장기 기억·모델 설정 포함, 확인 필요)
-  /memory               현재 장기 기억 내용 보기
-  /pwd                  현재 작업 디렉토리 출력
-  /ls [경로]            디렉토리 목록 출력
-  /cat <파일>           파일 내용 출력
-  /write <파일> <내용>  파일 작성 (확인 필요)
-  /rm <파일>            파일 삭제 (확인 필요)
-  /run <파일>           Python 파일 실행
-  /exec <명령>          셸 명령 실행
-  /codegen <설명>       Copilot으로 코드 생성
-  /help                 도움말 출력
-  /exit 또는 /quit      프로그램 종료
+  Or run directly:
+  python main.py           # Run from project folder, then /auth to authenticate
 
-인증 흐름 (OpenClaw 방식):
-  1. PowerShell에서 python .\\main.py 실행
-  2. /auth 입력
-  3. 터미널에 표시된 코드(예: ABCD-1234)를 확인
-  4. 브라우저에서 https://github.com/login/device 로 이동하여 코드 입력
-  5. GitHub 계정으로 승인
-  6. 터미널에 ✅ 인증 성공 메시지 표시 후 Copilot 사용 가능
+Authentication (OpenClaw style — GitHub device flow):
+  1. Run: sapiens wakeup
+  2. Type: /auth
+  3. Note the code shown in the terminal (e.g. ABCD-1234)
+  4. Open https://github.com/login/device in your browser and enter the code
+  5. Approve — Sapiens2.0 detects the approval automatically
+  6. Your account is saved for future runs (no need to re-authenticate)
 
-기억 시스템:
-  - 단기 기억(short-term): 현재 세션 대화 내역. 세션 종료 또는 /new 시 초기화.
-  - 장기 기억(long-term): sapiens_memory.json 파일에 저장. 세션 간 유지.
-    에이전트가 대화 중 중요한 정보를 자동으로 추출하여 장기 기억에 저장합니다.
+Key Commands:
+  /auth                 Start GitHub device flow authentication (recommended)
+  /auth <token>         Provide a GitHub PAT/OAuth token directly
+  /logout               Unlink the saved GitHub account
+  /models [num|name]    List or select available Copilot models
+  /new                  Start a new conversation (short-term memory cleared)
+  /reset                Full reset: long-term memory + model settings cleared
+  /memory               View long-term memory contents
+  /pwd                  Print current working directory
+  /ls [path]            List directory contents
+  /cat <file>           Read a file
+  /write <file> [text]  Write to a file (prompts if no text given)
+  /rm <file>            Delete a file (requires confirmation)
+  /cd <path>            Change working directory
+  /run <file>           Run a Python script
+  /exec <cmd>           Run a shell command
+  /codegen <desc>       Generate code with Copilot
+  /help                 Show help text
+  /exit or /quit        Exit
 
-의존성 (requirements.txt 참조):
+Memory system:
+  Short-term: session conversation history. Cleared on /new or exit.
+  Long-term:  sapiens_memory.json — persists across sessions. Cleared only on /reset.
+              The agent automatically extracts and saves important facts from conversations.
+
+Computer control:
+  The agent can control your computer by issuing tool commands in its responses.
+  Just ask naturally: "what files are in this folder?" or "run the tests" and the
+  agent will use the appropriate tools automatically.
+
+Dependencies:
   pip install requests
 """
 
@@ -62,67 +72,64 @@ from typing import Dict, List, Optional, Union
 try:
     import requests
 except ImportError:
-    print("[오류] 'requests' 패키지가 필요합니다. 다음 명령을 실행하세요: pip install requests")
+    print("[Error] 'requests' package is required. Run: pip install requests")
     sys.exit(1)
 
 # ─────────────────────────────────────────────
-#  상수 / 설정
+#  Constants / Configuration
 # ─────────────────────────────────────────────
 
-# GitHub OAuth App Client ID (GitHub CLI 공개 앱 — Copilot 인증에 사용됨).
-# OpenClaw 방식과 동일하게 사용자가 별도 OAuth App을 등록하지 않아도
-# 바로 GitHub device flow 인증을 사용할 수 있습니다.
-# 출처: https://github.com/cli/cli (공개 OAuth App)
+# GitHub OAuth App Client ID (GitHub CLI public app — used for Copilot auth).
+# Same approach as OpenClaw: no need to register your own OAuth App.
+# Source: https://github.com/cli/cli (public OAuth App)
 DEFAULT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 
-# GitHub Copilot 내부 API 엔드포인트
+# GitHub Copilot internal API endpoints
 COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
 COPILOT_CHAT_URL = "https://api.githubcopilot.com/chat/completions"
 
-# GitHub device flow 엔드포인트
+# GitHub device flow endpoints
 GH_DEVICE_CODE_URL = "https://github.com/login/device/code"
 GH_TOKEN_URL = "https://github.com/login/oauth/access_token"
 
-# GitHub device flow에서 요청하는 OAuth 스코프.
-# Copilot 토큰 교환을 위해 read:user 외에 추가 스코프가 필요합니다.
+# OAuth scopes required for Copilot token exchange
 GH_DEVICE_FLOW_SCOPE = "read:user copilot"
 
-# Copilot API 기본 모델 (환경에 따라 변경 가능)
+# Default Copilot model
 COPILOT_DEFAULT_MODEL = "gpt-4o"
 
-# Copilot API 토큰 유효 시간 (초). Copilot 토큰은 약 30분간 유효합니다.
+# Copilot API token lifetime (seconds). Copilot tokens are valid for ~30 minutes.
 COPILOT_TOKEN_LIFETIME_SECONDS = 1800
 
-# Copilot API 호출 시 사용하는 에디터 식별 헤더.
-# GitHub Copilot 내부 API는 호출자 식별을 위해 이 헤더들을 요구합니다.
+# Editor identification headers required by Copilot internal API
 _EDITOR_VERSION = "vscode/1.95.0"
 _PLUGIN_VERSION = "copilot-chat/0.22.3"
 _USER_AGENT = "GitHubCopilotChat/0.22.3"
-# copilot_internal/v2/token 엔드포인트의 GitHub API 버전
+# GitHub API version for copilot_internal/v2/token endpoint
 _GH_API_VERSION = "2022-11-28"
-# Copilot Chat Completions API의 GitHub API 버전 (엔드포인트별로 버전이 다릅니다)
+# GitHub API version for Copilot Chat Completions endpoint
 _GH_CHAT_API_VERSION = "2023-07-07"
 
-# Copilot 토큰 갱신 시 만료까지 이 초 이하로 남으면 미리 갱신합니다.
+# Renew Copilot token this many seconds before it expires
 COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS = 60
 
-# 위험 작업 목록 (실행 전 사용자 확인 요청)
+# Dangerous file extensions and commands (require user confirmation before running)
 DANGEROUS_EXTENSIONS = {".sh", ".bat", ".cmd", ".ps1", ".exe"}
 CONFIRM_REQUIRED_COMMANDS = {"rm", "del", "rmdir", "rd", "format", "mkfs", "dd"}
 
-# 시작 배너 너비
-BANNER_WIDTH = 54
+# Banner width
+BANNER_WIDTH = 60
 
-# 장기 기억 파일 경로 (프로젝트 폴더 기준)
+# Long-term memory file path (relative to working directory)
 MEMORY_FILE = "sapiens_memory.json"
 
-# 에이전트 상태 파일 (선택된 모델 등 저장)
+# Agent state file (stores selected model, etc.)
 STATE_FILE = "sapiens_state.json"
 
-# 단기 기억 최대 메시지 수 (초과 시 오래된 항목 제거)
+# Short-term memory max messages (older messages are pruned when exceeded)
 SHORT_TERM_MAX_MESSAGES = 20
 
-# 사용 가능한 Copilot 모델 목록 (API 조회 실패 시 기본값으로 사용)
+# Fallback list of Copilot models (used when API query fails)
 AVAILABLE_MODELS = [
     "gpt-4o",
     "gpt-4o-mini",
@@ -132,26 +139,76 @@ AVAILABLE_MODELS = [
     "o1-mini",
 ]
 
-# Copilot 모델 목록 API 엔드포인트
+# Copilot model list API endpoint
 COPILOT_MODELS_URL = "https://api.githubcopilot.com/models"
+
+# Persistent auth config (~/.sapiens2/config.json)
+AUTH_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".sapiens2")
+AUTH_CONFIG_FILE = os.path.join(AUTH_CONFIG_DIR, "config.json")
+
+# Regex to detect agent tool calls embedded in model responses
+# Format: <tool>/command args</tool>
+TOOL_CALL_RE = re.compile(r'<tool>(.*?)</tool>', re.DOTALL | re.IGNORECASE)
 
 
 # ─────────────────────────────────────────────
-#  모듈 0: 기억 관리 (단기/장기)
+#  Auth Persistence Helpers
+# ─────────────────────────────────────────────
+
+def _save_auth_token(token: str) -> None:
+    """Save GitHub token to ~/.sapiens2/config.json for persistence across runs.
+    The file is created with owner-only read/write permissions (0o600).
+    """
+    try:
+        os.makedirs(AUTH_CONFIG_DIR, exist_ok=True)
+        # Use os.open to enforce restrictive permissions from creation time,
+        # preventing other OS users from reading the OAuth token.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(AUTH_CONFIG_FILE, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"github_token": token}, f)
+    except IOError:
+        pass  # Non-fatal: session will still work without persistence
+
+
+def _load_auth_token() -> Optional[str]:
+    """Load saved GitHub token from ~/.sapiens2/config.json. Returns None if not found."""
+    if not os.path.exists(AUTH_CONFIG_FILE):
+        return None
+    try:
+        with open(AUTH_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        token = data.get("github_token")
+        return token if isinstance(token, str) and token.strip() else None
+    except (IOError, json.JSONDecodeError):
+        return None
+
+
+def _clear_auth_token() -> None:
+    """Remove the saved GitHub token from disk."""
+    if os.path.exists(AUTH_CONFIG_FILE):
+        try:
+            os.remove(AUTH_CONFIG_FILE)
+        except OSError:
+            pass
+
+
+# ─────────────────────────────────────────────
+#  Module 0: Memory Management (short/long term)
 # ─────────────────────────────────────────────
 
 class MemoryModule:
     """
-    단기/장기 기억 모듈.
+    Short-term and long-term memory module.
 
-    단기 기억(short-term):
-      - 현재 세션의 대화 내역 (role/content 메시지 리스트)
-      - 세션 종료 또는 /new 명령 시 초기화됨
+    Short-term memory:
+      - Current session conversation history (list of role/content messages)
+      - Cleared on session exit or /new command
 
-    장기 기억(long-term):
-      - sapiens_memory.json 파일에 JSON으로 저장
-      - 세션 간 유지, /reset 시에만 삭제
-      - 에이전트가 대화에서 중요한 정보를 자동 추출하여 업데이트
+    Long-term memory:
+      - Stored as JSON in sapiens_memory.json
+      - Persists across sessions; cleared only on /reset
+      - The agent automatically extracts important facts and stores them here
     """
 
     def __init__(self, memory_file: str = MEMORY_FILE):
@@ -160,26 +217,25 @@ class MemoryModule:
         self._short_term: List[Dict[str, str]] = []
         self._load()
 
-    # ── 단기 기억 ──────────────────────────────
+    # ── Short-term memory ───────────────────────
 
     def add_message(self, role: str, content: str) -> None:
-        """단기 기억(대화 내역)에 메시지를 추가합니다."""
+        """Add a message to short-term memory (conversation history)."""
         self._short_term.append({"role": role, "content": content})
-        # 최대 메시지 수를 항상 유지
         self._short_term = self._short_term[-SHORT_TERM_MAX_MESSAGES:]
 
     def get_short_term(self) -> List[Dict[str, str]]:
-        """단기 기억(대화 내역)을 반환합니다."""
+        """Return the current short-term memory (conversation history)."""
         return list(self._short_term)
 
     def clear_short_term(self) -> None:
-        """단기 기억(세션 대화)을 초기화합니다."""
+        """Clear short-term memory (session conversation)."""
         self._short_term = []
 
-    # ── 장기 기억 ──────────────────────────────
+    # ── Long-term memory ────────────────────────
 
     def _load(self) -> None:
-        """장기 기억 파일을 로드합니다."""
+        """Load long-term memory from file."""
         if os.path.exists(self._memory_file):
             try:
                 with open(self._memory_file, "r", encoding="utf-8") as f:
@@ -190,34 +246,34 @@ class MemoryModule:
                 self._long_term = {}
 
     def _save(self) -> None:
-        """장기 기억을 파일에 저장합니다."""
+        """Save long-term memory to file."""
         try:
             with open(self._memory_file, "w", encoding="utf-8") as f:
                 json.dump(self._long_term, f, ensure_ascii=False, indent=2)
         except IOError as e:
-            print(f"[메모리] 장기 기억 저장 실패: {e}")
+            print(f"[Memory] Failed to save long-term memory: {e}")
 
     def update_long_term(self, updates: Dict[str, str]) -> None:
-        """장기 기억을 업데이트하고 파일에 저장합니다."""
+        """Update long-term memory and save to file."""
         if updates:
             self._long_term.update({str(k): str(v) for k, v in updates.items()})
             self._save()
 
     def get_long_term(self) -> Dict[str, str]:
-        """장기 기억 전체를 반환합니다."""
+        """Return all long-term memory entries."""
         return dict(self._long_term)
 
     def get_long_term_context(self) -> str:
-        """장기 기억을 시스템 프롬프트에 포함할 텍스트 형태로 반환합니다."""
+        """Return long-term memory formatted for inclusion in the system prompt."""
         if not self._long_term:
             return ""
-        parts = ["[에이전트 장기 기억 — 이전 세션에서 기억된 정보]"]
+        parts = ["[Agent Long-Term Memory — facts remembered from previous sessions]"]
         for key, value in self._long_term.items():
             parts.append(f"  - {key}: {value}")
         return "\n".join(parts)
 
     def clear_long_term(self) -> None:
-        """장기 기억을 초기화하고 파일을 삭제합니다."""
+        """Clear long-term memory and delete the file."""
         self._long_term = {}
         if os.path.exists(self._memory_file):
             try:
@@ -226,9 +282,9 @@ class MemoryModule:
                 pass
 
     def get_display(self) -> str:
-        """장기 기억을 사람이 읽기 쉬운 형태로 반환합니다."""
+        """Return long-term memory in a human-readable format."""
         if not self._long_term:
-            return "(장기 기억 없음)"
+            return "(no long-term memory)"
         lines = []
         for key, value in self._long_term.items():
             lines.append(f"  • {key}: {value}")
@@ -236,42 +292,42 @@ class MemoryModule:
 
 
 # ─────────────────────────────────────────────
-#  모듈 1: GitHub Copilot 연동
+#  Module 1: GitHub Copilot Integration
 # ─────────────────────────────────────────────
 
 class CopilotModule:
     """
-    GitHub Copilot 연동 모듈.
+    GitHub Copilot integration module.
 
-    인증 방식:
-      1. 직접 토큰 입력: set_token(github_token)
+    Authentication methods:
+      1. Direct token: set_token(github_token)
       2. GitHub device flow: authenticate_device_flow(client_id)
 
-    토큰 종류:
-      - GitHub PAT (Personal Access Token) 또는 OAuth token
-      - 내부적으로 Copilot API 전용 토큰으로 교환하여 사용
+    Token types:
+      - GitHub PAT (Personal Access Token) or OAuth token
+      - Internally exchanged for a Copilot API token (30-minute lifetime)
     """
 
     def __init__(self):
-        self._github_token: Optional[str] = None   # GitHub OAuth/PAT 토큰
-        self._copilot_token: Optional[str] = None  # Copilot API 토큰 (만료 30분)
-        self._copilot_token_expires: float = 0  # 만료 시각 (epoch seconds)
-        self._model: str = COPILOT_DEFAULT_MODEL  # 선택된 모델
+        self._github_token: Optional[str] = None   # GitHub OAuth/PAT token
+        self._copilot_token: Optional[str] = None  # Copilot API token (expires in 30 min)
+        self._copilot_token_expires: float = 0  # Expiry timestamp (epoch seconds)
+        self._model: str = COPILOT_DEFAULT_MODEL  # Selected model
 
-    # ── 모델 선택 ──────────────────────────────
+    # ── Model selection ─────────────────────────
 
     def set_model(self, model: str) -> None:
-        """사용할 Copilot 모델을 설정합니다."""
+        """Set the Copilot model to use."""
         self._model = model
 
     def get_model(self) -> str:
-        """현재 선택된 모델명을 반환합니다."""
+        """Return the currently selected model name."""
         return self._model
 
     def list_models(self) -> List[str]:
         """
-        사용 가능한 Copilot 모델 목록을 반환합니다.
-        인증된 상태면 API에서 조회하고, 실패 시 기본 목록을 반환합니다.
+        Return available Copilot models.
+        Queries the API when authenticated; falls back to the built-in list on failure.
         """
         copilot_token = self._get_copilot_token()
         if copilot_token:
@@ -302,54 +358,55 @@ class CopilotModule:
 
         return list(AVAILABLE_MODELS)
 
-    # ── 토큰 설정 ──────────────────────────────
+    # ── Token management ────────────────────────
 
     def set_token(self, github_token: str) -> None:
-        """GitHub OAuth/PAT 토큰을 직접 설정합니다."""
+        """Set the GitHub OAuth/PAT token directly."""
         self._github_token = github_token.strip()
-        self._copilot_token = None  # 기존 Copilot 토큰 초기화
-        print("[Copilot] GitHub 토큰이 설정되었습니다.")
+        self._copilot_token = None  # Invalidate cached Copilot token
 
     def is_authenticated(self) -> bool:
-        """GitHub 토큰이 설정되어 있는지 확인합니다."""
+        """Return True if a GitHub token has been set."""
         return bool(self._github_token)
 
     def get_status(self) -> str:
-        """현재 인증 및 Copilot 토큰 상태를 반환합니다."""
+        """Return a human-readable authentication and token status string."""
         lines = []
+        saved = os.path.exists(AUTH_CONFIG_FILE)
         if self._github_token:
-            lines.append("  GitHub 토큰  : ✅ 설정됨")
+            saved_note = "  (saved — will auto-login on next run)" if saved else ""
+            lines.append(f"  GitHub token : ✅ set{saved_note}")
         else:
-            lines.append("  GitHub 토큰  : ❌ 미설정 (/auth 로 인증하세요)")
+            lines.append("  GitHub token : ❌ not set  (run /auth to authenticate)")
 
         if self._copilot_token and time.time() < self._copilot_token_expires - COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS:
             remaining = int(self._copilot_token_expires - time.time())
-            lines.append(f"  Copilot 토큰 : ✅ 유효 (약 {remaining}초 남음)")
+            lines.append(f"  Copilot token: ✅ valid ({remaining}s remaining)")
         elif self._github_token:
-            lines.append("  Copilot 토큰 : ℹ️  첫 메시지 입력 시 자동 교환됩니다")
+            lines.append("  Copilot token: ℹ️  will be exchanged on first message")
         else:
-            lines.append("  Copilot 토큰 : ❌ 미교환")
+            lines.append("  Copilot token: ❌ not exchanged")
 
-        lines.append(f"  선택된 모델  : {self._model}")
+        lines.append(f"  Model        : {self._model}")
 
         return "\n" + "\n".join(lines)
 
-    # ── Device Flow 인증 ───────────────────────
+    # ── Device flow authentication ──────────────
 
     def authenticate_device_flow(self, client_id: str = DEFAULT_CLIENT_ID) -> bool:
         """
-        GitHub device flow를 사용해 사용자 인증을 수행합니다.
+        Authenticate using the GitHub device flow (same approach as OpenClaw).
 
-        1. GitHub에서 device code와 user code를 받습니다.
-        2. 사용자가 브라우저에서 코드를 입력/승인합니다.
-        3. 승인 완료 시 GitHub OAuth 토큰을 저장합니다.
+        1. Request a device code from GitHub.
+        2. User visits the verification URL and enters the code shown in the terminal.
+        3. Poll until approval is detected, then store the OAuth token.
 
         Returns:
-            True: 인증 성공, False: 인증 실패
+            True on success, False on failure.
         """
-        print("[Copilot] GitHub device flow 인증을 시작합니다...")
+        print("[Copilot] Starting GitHub device flow authentication...")
 
-        # 1단계: device code 요청
+        # Step 1: request device code
         try:
             resp = requests.post(
                 GH_DEVICE_CODE_URL,
@@ -359,7 +416,7 @@ class CopilotModule:
             )
             resp.raise_for_status()
         except requests.RequestException as e:
-            print(f"[Copilot 오류] device code 요청 실패: {e}")
+            print(f"[Copilot Error] Failed to request device code: {e}")
             return False
 
         data = resp.json()
@@ -369,16 +426,17 @@ class CopilotModule:
         interval = data.get("interval", 5)
         expires_in = data.get("expires_in", 900)
 
-        print(f"\n  ┌─────────────────────────────────────────────────┐")
-        print(f"  │  브라우저에서 아래 URL을 열고 코드를 입력하세요.  │")
-        print(f"  │                                                 │")
-        print(f"  │  URL  : {verification_uri:<39} │")
-        print(f"  │  코드 : {user_code:<39} │")
-        print(f"  │                                                 │")
-        print(f"  │  유효 시간: {expires_in}초{' ' * (36 - len(str(expires_in)))}│")
-        print(f"  └─────────────────────────────────────────────────┘\n")
+        print(f"\n  ┌─────────────────────────────────────────────────────┐")
+        print(f"  │  Open the URL below in your browser and enter the   │")
+        print(f"  │  code to authorize Sapiens2.0.                      │")
+        print(f"  │                                                     │")
+        print(f"  │  URL  : {verification_uri:<43} │")
+        print(f"  │  Code : {user_code:<43} │")
+        print(f"  │                                                     │")
+        print(f"  │  Expires in: {expires_in}s{' ' * (39 - len(str(expires_in)))}│")
+        print(f"  └─────────────────────────────────────────────────────┘\n")
 
-        # 2단계: 승인 폴링
+        # Step 2: poll for approval
         deadline = time.time() + expires_in
         while time.time() < deadline:
             time.sleep(interval)
@@ -395,44 +453,50 @@ class CopilotModule:
                 )
                 poll_resp.raise_for_status()
             except requests.RequestException as e:
-                print(f"[Copilot 오류] 토큰 폴링 실패: {e}")
+                print(f"[Copilot Error] Token polling failed: {e}")
                 return False
 
             poll_data = poll_resp.json()
             if "access_token" in poll_data:
-                self._github_token = poll_data["access_token"]
-                self._copilot_token = None
-                print("[Copilot] ✅ GitHub 인증 성공!")
-                print("[Copilot] ℹ️  첫 메시지 입력 시 Copilot 구독 확인 및 토큰 교환을 시도합니다.")
-                return True
+                return self._finish_device_flow_success(poll_data["access_token"])
 
             error = poll_data.get("error", "")
             if error == "authorization_pending":
-                print("[Copilot] 승인 대기 중... (브라우저에서 코드를 입력해주세요)")
+                print("[Copilot] Waiting for approval... (enter the code in your browser)")
             elif error == "slow_down":
                 interval += 5
             elif error in ("expired_token", "access_denied"):
-                print(f"[Copilot 오류] {error}")
+                print(f"[Copilot Error] {error}")
                 return False
 
-        print("[Copilot 오류] 인증 시간이 초과되었습니다.")
+        print("[Copilot Error] Authentication timed out.")
         return False
 
-    # ── Copilot API 토큰 교환 ──────────────────
+    def _finish_device_flow_success(self, access_token: str) -> bool:
+        """Store the token in memory and persist it to disk after successful device flow auth."""
+        self._github_token = access_token
+        self._copilot_token = None
+        _save_auth_token(access_token)
+        print("[Copilot] ✅ GitHub authentication successful!")
+        print("[Copilot] ℹ️  Your account has been saved — no need to re-authenticate next time.")
+        print("[Copilot] ℹ️  Copilot access will be verified on your first message.")
+        return True
+
+    # ── Copilot API token exchange ──────────────
 
     def _get_copilot_token(self) -> Optional[str]:
         """
-        GitHub OAuth 토큰을 Copilot API 전용 토큰으로 교환합니다.
-        토큰은 30분 유효하며, 만료 시 자동으로 갱신됩니다.
+        Exchange the GitHub OAuth token for a Copilot API token.
+        The Copilot token is valid for 30 minutes and is automatically renewed when expired.
 
         Returns:
-            Copilot API 토큰 문자열 또는 None (실패 시)
+            Copilot API token string, or None on failure.
         """
         if not self._github_token:
-            print("[Copilot 오류] GitHub 토큰이 설정되지 않았습니다. /auth 명령을 사용하세요.")
+            print("[Copilot Error] No GitHub token set. Run /auth to authenticate.")
             return None
 
-        # 토큰이 유효하면 재사용
+        # Reuse existing token if still valid
         if self._copilot_token and time.time() < self._copilot_token_expires - COPILOT_TOKEN_EXPIRY_BUFFER_SECONDS:
             return self._copilot_token
 
@@ -453,27 +517,26 @@ class CopilotModule:
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
             if status == 401:
-                print("[Copilot 오류] GitHub 토큰이 유효하지 않거나 만료되었습니다. 다시 /auth 를 실행하세요.")
+                print("[Copilot Error] GitHub token is invalid or expired. Run /auth again.")
             elif status == 403:
                 print(
-                    "[Copilot 오류] GitHub Copilot 토큰 교환이 거부되었습니다 (HTTP 403).\n"
-                    "  원인 1: 이 GitHub 계정에 활성 Copilot 구독이 없습니다.\n"
-                    "           → https://github.com/settings/copilot 에서 구독 상태를 확인하세요.\n"
-                    "  원인 2: 인증 시 요청한 OAuth 스코프가 부족합니다.\n"
-                    "           → /auth 를 다시 실행하여 새 토큰을 발급받으세요.\n"
-                    "  원인 3: 조직 SSO 정책으로 인해 토큰이 차단되었을 수 있습니다.\n"
-                    "           → GitHub SSO 승인 페이지에서 이 앱을 승인하세요."
+                    "[Copilot Error] Copilot token exchange denied (HTTP 403).\n"
+                    "  Possible causes:\n"
+                    "  1. No active Copilot subscription on this GitHub account.\n"
+                    "     → Check subscription at https://github.com/settings/copilot\n"
+                    "  2. Insufficient OAuth scopes — run /auth again to get a fresh token.\n"
+                    "  3. Organization SSO policy blocking this app — approve at GitHub SSO settings."
                 )
             elif status == 404:
                 print(
-                    "[Copilot 오류] Copilot 토큰 교환 엔드포인트를 찾을 수 없습니다 (HTTP 404).\n"
-                    "  GitHub Copilot 내부 API 주소가 변경되었을 수 있습니다."
+                    "[Copilot Error] Copilot token exchange endpoint not found (HTTP 404).\n"
+                    "  The Copilot internal API address may have changed."
                 )
             else:
-                print(f"[Copilot 오류] Copilot 토큰 교환 실패 (HTTP {status}): {e}")
+                print(f"[Copilot Error] Copilot token exchange failed (HTTP {status}): {e}")
             return None
         except requests.RequestException as e:
-            print(f"[Copilot 오류] 네트워크 오류 (Copilot 토큰 교환): {e}")
+            print(f"[Copilot Error] Network error (Copilot token exchange): {e}")
             return None
 
         token_data = resp.json()
@@ -484,18 +547,18 @@ class CopilotModule:
         )
         return self._copilot_token
 
-    # ── 코드 생성 / 채팅 ───────────────────────
+    # ── Code generation / chat ──────────────────
 
     def generate_code(self, prompt: str, language: str = "python") -> Optional[str]:
         """
-        Copilot을 사용해 코드를 생성합니다.
+        Generate code using Copilot.
 
         Args:
-            prompt: 생성할 코드 설명 (자연어)
-            language: 코드 언어 (기본값: python)
+            prompt: Natural language description of the code to generate.
+            language: Target programming language (default: python).
 
         Returns:
-            생성된 코드 문자열 또는 None (실패 시)
+            Generated code string, or None on failure.
         """
         system_msg = (
             f"You are GitHub Copilot, an expert {language} programmer. "
@@ -511,16 +574,16 @@ class CopilotModule:
         long_term_context: str = "",
     ) -> Optional[str]:
         """
-        Copilot과 자연어 대화를 수행합니다.
-        단기 기억(conversation history)과 장기 기억 컨텍스트를 포함합니다.
+        Send a message to Copilot and return the response.
+        Includes short-term memory (conversation history) and long-term memory context.
 
         Args:
-            message: 사용자 메시지
-            history: 이전 대화 내역 (단기 기억)
-            long_term_context: 장기 기억 텍스트
+            message: User message.
+            history: Previous conversation messages (short-term memory).
+            long_term_context: Long-term memory text to include in system prompt.
 
         Returns:
-            Copilot의 응답 문자열 또는 None (실패 시)
+            Copilot response string, or None on failure.
         """
         system_parts = [
             "You are Sapiens2.0, a helpful AI agent assistant. "
@@ -540,15 +603,15 @@ class CopilotModule:
 
     def extract_memory_updates(self, user_msg: str, assistant_response: str) -> Dict[str, str]:
         """
-        대화 교환에서 장기 기억으로 저장할 중요한 정보를 추출합니다.
-        모델이 직접 기억 파일을 관리하는 핵심 메서드입니다.
+        Extract important long-term facts from a conversation exchange.
+        This is how the agent self-manages its long-term memory file.
 
         Args:
-            user_msg: 사용자 메시지
-            assistant_response: 에이전트 응답
+            user_msg: User message.
+            assistant_response: Agent response.
 
         Returns:
-            장기 기억에 추가/갱신할 키-값 쌍 딕셔너리 (없으면 빈 딕셔너리)
+            Dict of key-value pairs to add/update in long-term memory (empty if nothing noteworthy).
         """
         system_prompt = (
             "You are a memory manager for an AI agent called Sapiens2.0. "
@@ -569,16 +632,15 @@ class CopilotModule:
         if not result:
             return {}
 
-        # JSON 파싱 - 중첩 객체도 처리하는 방식으로 추출
+        # Try parsing the full text as JSON first
         try:
-            # 전체 텍스트가 유효한 JSON인지 먼저 시도
             data = json.loads(result.strip())
             if isinstance(data, dict):
                 return {str(k): str(v) for k, v in data.items()}
         except json.JSONDecodeError:
             pass
 
-        # 중괄호 깊이를 카운팅하여 첫 번째 완전한 JSON 객체 추출
+        # Fall back to extracting the first complete JSON object by brace depth counting
         start = result.find("{")
         if start != -1:
             depth = 0
@@ -598,7 +660,7 @@ class CopilotModule:
         return {}
 
     def _call_copilot_api(self, system_prompt: str, user_message: str, max_tokens: int = 1024) -> Optional[str]:
-        """단일 사용자 메시지로 Copilot Chat Completions API를 호출합니다."""
+        """Call the Copilot Chat Completions API with a single user message."""
         messages = [{"role": "user", "content": user_message}]
         return self._call_copilot_api_messages(system_prompt, messages, max_tokens=max_tokens)
 
@@ -609,15 +671,15 @@ class CopilotModule:
         max_tokens: int = 1024,
     ) -> Optional[str]:
         """
-        대화 내역(messages 리스트)을 포함하여 Copilot Chat Completions API를 호출합니다.
+        Call the Copilot Chat Completions API with a conversation history.
 
         Args:
-            system_prompt: 시스템 프롬프트
-            messages: 대화 메시지 리스트 [{role, content}, ...]
-            max_tokens: 최대 토큰 수
+            system_prompt: System prompt content.
+            messages: Conversation messages [{role, content}, ...].
+            max_tokens: Maximum tokens to generate.
 
         Returns:
-            응답 텍스트 또는 None (실패 시)
+            Response text, or None on failure.
         """
         copilot_token = self._get_copilot_token()
         if not copilot_token:
@@ -654,98 +716,82 @@ class CopilotModule:
             status = e.response.status_code if e.response is not None else "?"
             if status == 401:
                 print(
-                    "[Copilot 오류] Copilot API 인증 실패 (HTTP 401). Copilot 토큰이 만료되었습니다.\n"
-                    "  다음 요청 시 자동으로 토큰을 갱신합니다. 문제가 반복되면 /auth 를 다시 실행하세요."
+                    "[Copilot Error] Copilot API auth failed (HTTP 401). Token may have expired.\n"
+                    "  The token will be renewed automatically. If this persists, run /auth again."
                 )
-                self._copilot_token = None  # 만료된 토큰 초기화
+                self._copilot_token = None  # Clear expired token
             elif status == 403:
                 print(
-                    "[Copilot 오류] Copilot API 접근 거부 (HTTP 403).\n"
-                    "  Copilot 구독 상태를 확인하세요: https://github.com/settings/copilot"
+                    "[Copilot Error] Copilot API access denied (HTTP 403).\n"
+                    "  Check your Copilot subscription: https://github.com/settings/copilot"
                 )
             elif status == 404:
                 print(
-                    "[Copilot 오류] Copilot Chat API 엔드포인트를 찾을 수 없습니다 (HTTP 404).\n"
-                    "  요청 모델명 또는 API 주소가 올바른지 확인하세요."
+                    "[Copilot Error] Copilot Chat API endpoint not found (HTTP 404).\n"
+                    "  Verify the model name or API address."
                 )
             elif status == 422:
                 print(
-                    "[Copilot 오류] 요청 형식이 잘못되었습니다 (HTTP 422).\n"
-                    "  모델명이나 요청 파라미터를 확인하세요."
+                    "[Copilot Error] Invalid request format (HTTP 422).\n"
+                    "  Check the model name and request parameters."
                 )
             else:
-                print(f"[Copilot 오류] Copilot Chat API 호출 실패 (HTTP {status}): {e}")
+                print(f"[Copilot Error] Copilot Chat API call failed (HTTP {status}): {e}")
             return None
         except requests.RequestException as e:
-            print(f"[Copilot 오류] 네트워크 오류 (Chat API): {e}")
+            print(f"[Copilot Error] Network error (Chat API): {e}")
             return None
 
         try:
             result = resp.json()
             return result["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, ValueError) as e:
-            print(f"[Copilot 오류] 응답 파싱 실패: {e}")
+            print(f"[Copilot Error] Failed to parse response: {e}")
             return None
 
 
 # ─────────────────────────────────────────────
-#  모듈 2: 시스템 명령 (컴퓨터 통제)
+#  Module 2: Computer Control (System Commands)
 # ─────────────────────────────────────────────
 
 class SystemCommandModule:
     """
-    파일 시스템 탐색, 파일 수정, 명령 실행 등 컴퓨터 통제 모듈.
+    Computer control module: file system navigation, file editing, command execution.
 
-    안전 정책:
-      - 파일 삭제, 민감 명령 실행 시 사용자 확인 요구
-      - 위험 확장자(.sh, .bat, .exe 등) 실행 시 경고 표시
+    Safety policy:
+      - File deletion and sensitive commands require user confirmation.
+      - Dangerous file extensions (.sh, .bat, .exe, etc.) trigger a warning before execution.
     """
 
     def __init__(self):
-        self._cwd = os.getcwd()  # 현재 작업 디렉토리
+        self._cwd = os.getcwd()
 
     def get_cwd(self) -> str:
-        """현재 작업 디렉토리를 반환합니다."""
+        """Return the current working directory."""
         return self._cwd
 
     def change_dir(self, path: str) -> str:
-        """
-        작업 디렉토리를 변경합니다.
-
-        Args:
-            path: 변경할 경로 (절대 또는 상대 경로)
-
-        Returns:
-            결과 메시지 문자열
-        """
+        """Change the working directory."""
         target = os.path.abspath(os.path.join(self._cwd, path))
         if not os.path.isdir(target):
-            return f"[오류] 디렉토리가 존재하지 않습니다: {target}"
+            return f"[Error] Directory not found: {target}"
         self._cwd = target
         os.chdir(target)
-        return f"현재 폴더: {self._cwd}"
+        return f"Working directory: {self._cwd}"
 
     def list_dir(self, path: str = ".") -> str:
-        """
-        디렉토리 목록을 반환합니다.
-
-        Args:
-            path: 목록을 볼 경로 (기본값: 현재 디렉토리)
-
-        Returns:
-            파일/폴더 목록 문자열
-        """
+        """List the contents of a directory."""
         target = os.path.abspath(os.path.join(self._cwd, path))
         if not os.path.exists(target):
-            return f"[오류] 경로가 존재하지 않습니다: {target}"
+            return f"[Error] Path not found: {target}"
 
         try:
             entries = os.listdir(target)
         except PermissionError:
-            return f"[오류] 접근 권한이 없습니다: {target}"
+            return f"[Error] Permission denied: {target}"
 
         if not entries:
-            return f"{target} (비어 있음)"
+            return f"{target} (empty)"
 
         lines = [f"📁 {target}"]
         for entry in sorted(entries):
@@ -755,44 +801,27 @@ class SystemCommandModule:
         return "\n".join(lines)
 
     def read_file(self, path: str) -> str:
-        """
-        파일 내용을 읽어 반환합니다.
-
-        Args:
-            path: 파일 경로
-
-        Returns:
-            파일 내용 문자열
-        """
+        """Read and return the contents of a file."""
         target = os.path.abspath(os.path.join(self._cwd, path))
         if not os.path.isfile(target):
-            return f"[오류] 파일이 존재하지 않습니다: {target}"
+            return f"[Error] File not found: {target}"
 
         try:
             with open(target, "r", encoding="utf-8") as f:
                 content = f.read()
             return f"--- {target} ---\n{content}\n---"
         except UnicodeDecodeError:
-            return f"[오류] 바이너리 파일은 읽을 수 없습니다: {target}"
+            return f"[Error] Cannot read binary file: {target}"
         except PermissionError:
-            return f"[오류] 접근 권한이 없습니다: {target}"
+            return f"[Error] Permission denied: {target}"
 
     def write_file(self, path: str, content: str) -> str:
-        """
-        파일에 내용을 작성합니다. 기존 파일이 있으면 사용자 확인을 요청합니다.
-
-        Args:
-            path: 파일 경로
-            content: 작성할 내용
-
-        Returns:
-            결과 메시지 문자열
-        """
+        """Write content to a file. Asks for confirmation if the file already exists."""
         target = os.path.abspath(os.path.join(self._cwd, path))
 
         if os.path.exists(target):
-            if not _confirm(f"⚠️  '{target}' 파일이 이미 존재합니다. 덮어쓰겠습니까?"):
-                return "취소되었습니다."
+            if not _confirm(f"⚠️  '{target}' already exists. Overwrite?"):
+                return "Cancelled."
 
         try:
             dirname = os.path.dirname(target)
@@ -800,55 +829,38 @@ class SystemCommandModule:
                 os.makedirs(dirname, exist_ok=True)
             with open(target, "w", encoding="utf-8") as f:
                 f.write(content)
-            return f"✅ 파일 작성 완료: {target}"
+            return f"✅ File written: {target}"
         except PermissionError:
-            return f"[오류] 접근 권한이 없습니다: {target}"
+            return f"[Error] Permission denied: {target}"
 
     def delete_file(self, path: str) -> str:
-        """
-        파일을 삭제합니다. 항상 사용자 확인을 요청합니다.
-
-        Args:
-            path: 삭제할 파일 경로
-
-        Returns:
-            결과 메시지 문자열
-        """
+        """Delete a file. Always asks for confirmation."""
         target = os.path.abspath(os.path.join(self._cwd, path))
         if not os.path.exists(target):
-            return f"[오류] 파일이 존재하지 않습니다: {target}"
+            return f"[Error] File not found: {target}"
 
-        if not _confirm(f"⚠️  '{target}' 파일을 삭제하겠습니까? (되돌릴 수 없습니다)"):
-            return "취소되었습니다."
+        if not _confirm(f"⚠️  Delete '{target}'? (cannot be undone)"):
+            return "Cancelled."
 
         try:
             os.remove(target)
-            return f"✅ 파일 삭제 완료: {target}"
+            return f"✅ File deleted: {target}"
         except PermissionError:
-            return f"[오류] 접근 권한이 없습니다: {target}"
+            return f"[Error] Permission denied: {target}"
         except IsADirectoryError:
-            return f"[오류] 디렉토리는 /rm 으로 삭제할 수 없습니다. rmdir를 사용하세요."
+            return "[Error] Cannot delete a directory with /rm. Use rmdir."
 
     def run_file(self, path: str) -> str:
-        """
-        Python 스크립트 또는 셸 스크립트를 실행합니다.
-        위험 확장자 파일 실행 시 사용자 확인을 요청합니다.
-
-        Args:
-            path: 실행할 파일 경로
-
-        Returns:
-            실행 결과 문자열
-        """
+        """Run a Python script or shell script. Warns before executing dangerous file types."""
         target = os.path.abspath(os.path.join(self._cwd, path))
         if not os.path.isfile(target):
-            return f"[오류] 파일이 존재하지 않습니다: {target}"
+            return f"[Error] File not found: {target}"
 
         ext = os.path.splitext(target)[1].lower()
 
         if ext in DANGEROUS_EXTENSIONS:
-            if not _confirm(f"⚠️  '{target}'은 위험한 파일 유형입니다. 실행하겠습니까?"):
-                return "취소되었습니다."
+            if not _confirm(f"⚠️  '{target}' is a potentially dangerous file type. Run anyway?"):
+                return "Cancelled."
 
         if ext == ".py":
             cmd = [sys.executable, target]
@@ -858,39 +870,31 @@ class SystemCommandModule:
         return _run_subprocess(cmd, cwd=self._cwd)
 
     def exec_command(self, command: str) -> str:
-        """
-        셸 명령을 실행합니다. 위험 명령어 실행 시 사용자 확인을 요청합니다.
-
-        Args:
-            command: 실행할 셸 명령어
-
-        Returns:
-            실행 결과 문자열
-        """
+        """Run a shell command. Asks for confirmation before executing dangerous commands."""
         first_word = command.strip().split()[0].lower() if command.strip() else ""
         if first_word in CONFIRM_REQUIRED_COMMANDS:
-            if not _confirm(f"⚠️  '{command}' 명령은 위험할 수 있습니다. 실행하겠습니까?"):
-                return "취소되었습니다."
+            if not _confirm(f"⚠️  '{command}' may be dangerous. Run anyway?"):
+                return "Cancelled."
 
         return _run_subprocess(command, shell=True, cwd=self._cwd)
 
 
 # ─────────────────────────────────────────────
-#  모듈 3: 에이전트 Core
+#  Module 3: Agent Core
 # ─────────────────────────────────────────────
 
 class AgentCore:
     """
-    Sapiens2.0 에이전트 핵심 모듈.
+    Sapiens2.0 core agent module.
 
-    사용자 입력을 분석하여 적절한 모듈(Copilot, System, Memory)로 라우팅합니다.
+    Routes user input to the appropriate module (Copilot, System, Memory).
 
-    기억 구조:
-      - 단기 기억: MemoryModule._short_term (세션 대화 내역)
-      - 장기 기억: sapiens_memory.json (세션 간 지속)
+    Memory structure:
+      - Short-term: MemoryModule._short_term (session conversation history)
+      - Long-term:  sapiens_memory.json (persists across sessions)
 
-    상태 파일:
-      - sapiens_state.json: 선택된 모델 등 에이전트 상태 저장
+    State file:
+      - sapiens_state.json: stores selected model and other settings
     """
 
     def __init__(self, github_token: Optional[str] = None, client_id: str = DEFAULT_CLIENT_ID):
@@ -899,16 +903,21 @@ class AgentCore:
         self.memory = MemoryModule()
         self.client_id = client_id
 
-        # 저장된 상태(모델 선택 등) 불러오기
+        # Load saved state (model selection, etc.)
         self._load_state()
 
+        # Token priority: explicit arg > env var > saved auth file
         if github_token:
             self.copilot.set_token(github_token)
+        else:
+            saved_token = _load_auth_token()
+            if saved_token:
+                self.copilot.set_token(saved_token)
 
-    # ── 상태 관리 ──────────────────────────────
+    # ── State management ────────────────────────
 
     def _load_state(self) -> None:
-        """에이전트 상태 파일에서 설정을 불러옵니다."""
+        """Load agent state (model selection, etc.) from disk."""
         if os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -920,167 +929,290 @@ class AgentCore:
                 pass
 
     def _save_state(self) -> None:
-        """현재 에이전트 상태를 파일에 저장합니다."""
+        """Persist current agent state to disk."""
         try:
             state = {"model": self.copilot.get_model()}
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
         except IOError as e:
-            print(f"[상태] 상태 저장 실패: {e}")
+            print(f"[State] Failed to save state: {e}")
 
-    # ── 입력 처리 ──────────────────────────────
+    # ── Input processing ────────────────────────
 
     def process(self, user_input: str) -> str:
         """
-        사용자 입력을 처리하고 결과를 반환합니다.
+        Process user input and return a response.
 
-        슬래시 명령(/cmd)은 직접 처리하고,
-        일반 텍스트는 Copilot 채팅으로 전달합니다.
+        Slash commands (/cmd) are handled directly.
+        Plain text is routed through the agentic chat loop with computer control support.
 
         Args:
-            user_input: 사용자 입력 문자열
+            user_input: Raw user input string.
 
         Returns:
-            에이전트 응답 문자열
+            Agent response string. May be empty if all output was already printed inline
+            during the agent tool execution loop.
         """
         raw = user_input.strip()
         if not raw:
             return ""
 
-        # ── 슬래시 명령 처리 ────────────────────
+        # Handle slash commands
         if raw.startswith("/"):
             return self._handle_slash_command(raw)
 
-        # ── 자연어 입력 → Copilot 채팅 ──────────
+        # Plain text → agentic Copilot chat
         if not self.copilot.is_authenticated():
             return (
-                "💬 Copilot이 연결되어 있지 않습니다.\n"
-                "  /auth          를 입력해 GitHub device flow 인증을 시작하세요.\n"
-                "                 (브라우저에서 https://github.com/login/device 접속 후 코드 입력)\n"
-                "  /auth <token>  으로 GitHub PAT/OAuth 토큰을 직접 전달할 수도 있습니다.\n\n"
-                "  슬래시 명령(/pwd, /ls, /help 등)은 인증 없이 사용 가능합니다."
+                "💬 Not connected to Copilot.\n"
+                "  /auth          — start GitHub device flow authentication\n"
+                "                   (visit https://github.com/login/device and enter the code)\n"
+                "  /auth <token>  — provide a GitHub PAT/OAuth token directly\n\n"
+                "  Slash commands (/pwd, /ls, /help, etc.) work without authentication."
             )
 
-        # 장기 기억 컨텍스트와 단기 기억(대화 내역)을 포함하여 채팅
         lt_context = self.memory.get_long_term_context()
         history = self.memory.get_short_term()
 
-        # 사용자 메시지를 단기 기억에 추가
+        # Add user message to short-term memory before calling the agent
         self.memory.add_message("user", raw)
 
-        response = self.copilot.chat(raw, history=history, long_term_context=lt_context)
+        response = self._run_agent_chat(raw, history, lt_context)
         if response:
-            # 응답을 단기 기억에 추가
             self.memory.add_message("assistant", response)
-            # 대화에서 중요한 정보를 추출하여 장기 기억 업데이트 (비동기적으로 수행)
             self._try_update_long_term_memory(raw, response)
             return response
 
-        return "[오류] Copilot 응답을 받지 못했습니다."
+        return "[Error] No response received from Copilot."
 
     def _try_update_long_term_memory(self, user_msg: str, assistant_response: str) -> None:
-        """대화에서 중요한 정보를 추출해 장기 기억을 업데이트합니다."""
+        """Extract and persist important facts from the conversation to long-term memory."""
         try:
             updates = self.copilot.extract_memory_updates(user_msg, assistant_response)
             if updates:
                 self.memory.update_long_term(updates)
         except Exception:
-            pass  # 장기 기억 업데이트 실패 시 무시
+            pass  # Non-fatal: long-term memory update failure is silently ignored
 
-    def _handle_slash_command(self, raw: str) -> str:
-        """슬래시(/) 명령을 파싱하고 실행합니다."""
-        parts = raw.split(None, 2)  # 최대 3개 토큰 분리
+    # ── Agentic computer control loop ───────────
+
+    def _execute_agent_tool(self, cmd_str: str) -> str:
+        """
+        Execute a computer control tool command issued by the agent.
+        Supports read-only and safe operations; write/delete require user confirmation.
+
+        Args:
+            cmd_str: Full slash command string (e.g. '/ls .', '/cat README.md').
+
+        Returns:
+            Tool execution result as a string.
+        """
+        cmd_str = cmd_str.strip()
+        parts = cmd_str.split(None, 2)
+        if not parts:
+            return "[Error] Empty tool command"
+
         cmd = parts[0].lower()
         arg1 = parts[1] if len(parts) > 1 else ""
         arg2 = parts[2] if len(parts) > 2 else ""
 
-        # ── 인증 ────────────────────────────────
+        if cmd == "/pwd":
+            return self.system.get_cwd()
+        elif cmd == "/ls":
+            return self.system.list_dir(arg1 if arg1 else ".")
+        elif cmd == "/cat":
+            if not arg1:
+                return "[Error] Usage: /cat <file>"
+            return self.system.read_file(arg1)
+        elif cmd == "/cd":
+            if not arg1:
+                return "[Error] Usage: /cd <path>"
+            return self.system.change_dir(arg1)
+        elif cmd == "/exec":
+            full = cmd_str[len("/exec"):].strip()
+            if not full:
+                return "[Error] Usage: /exec <command>"
+            return self.system.exec_command(full)
+        elif cmd == "/run":
+            if not arg1:
+                return "[Error] Usage: /run <file.py>"
+            return self.system.run_file(arg1)
+        else:
+            return f"[Error] Unknown tool: {cmd}"
+
+    def _run_agent_chat(self, user_msg: str, history: list, lt_context: str) -> str:
+        """
+        Agentic chat loop: the model can issue computer control tool calls in its
+        response using <tool>/command args</tool> tags. Tool results are fed back
+        to the model, and the loop continues until the model gives a final answer
+        with no more tool calls (up to 5 iterations).
+
+        Intermediate tool execution output is printed inline so the user can follow
+        along in real time. Only the final natural language answer is returned.
+
+        Args:
+            user_msg: Current user message.
+            history: Short-term memory before this message (for context).
+            lt_context: Long-term memory context string.
+
+        Returns:
+            Final model response (natural language answer to the user).
+        """
+        system_prompt = _build_agent_system_prompt(lt_context)
+        messages: List[Dict[str, str]] = list(history) + [{"role": "user", "content": user_msg}]
+
+        last_response = ""
+
+        for _turn in range(5):  # max 5 tool-call iterations per turn
+            response = self.copilot._call_copilot_api_messages(
+                system_prompt, messages, max_tokens=2048
+            )
+            if not response:
+                return last_response or "[Error] No response received."
+
+            last_response = response
+            tool_calls = TOOL_CALL_RE.findall(response)
+
+            if not tool_calls:
+                # No tool calls → this is the final answer
+                return response
+
+            # Print any narrative text the model wrote around the tool calls
+            clean_text = TOOL_CALL_RE.sub("", response).strip()
+            if clean_text:
+                print(f"[Sapiens2.0] {clean_text}")
+
+            # Execute each tool call and collect results
+            tool_results: List[str] = []
+            for tool_cmd in tool_calls:
+                tool_cmd = tool_cmd.strip()
+                print(f"  ⚙  {tool_cmd}")
+                result = self._execute_agent_tool(tool_cmd)
+                # Print result with indentation for readability
+                for line in result.splitlines():
+                    print(f"     {line}")
+                print()
+                tool_results.append(f"[{tool_cmd}]:\n{result}")
+
+            # Feed results back to the model
+            messages.append({"role": "assistant", "content": response})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Tool execution results:\n\n"
+                    + "\n\n".join(tool_results)
+                    + "\n\nThe results above have been shown to the user. "
+                    "Please provide a brief, helpful natural language response summarizing "
+                    "what you found or did."
+                ),
+            })
+
+        return last_response
+
+    def _handle_slash_command(self, raw: str) -> str:
+        """Parse and execute a slash command."""
+        parts = raw.split(None, 2)  # Split into at most 3 tokens
+        cmd = parts[0].lower()
+        arg1 = parts[1] if len(parts) > 1 else ""
+        arg2 = parts[2] if len(parts) > 2 else ""
+
+        # ── Authentication ───────────────────────
         if cmd == "/auth":
             if arg1:
-                # 직접 토큰 입력 (/auth <token>)
+                # Direct token (/auth <token>)
                 self.copilot.set_token(arg1)
-                return "✅ GitHub 토큰이 설정되었습니다."
+                _save_auth_token(arg1)
+                return "✅ GitHub token set and saved for future sessions."
             else:
-                # OpenClaw 방식: GitHub device flow 인증
+                # OpenClaw-style GitHub device flow
                 ok = self.copilot.authenticate_device_flow(self.client_id)
-                return "✅ 인증 완료!" if ok else "❌ 인증 실패. 다시 시도하세요."
+                return "✅ Authentication complete!" if ok else "❌ Authentication failed. Please try again."
 
-        # ── 인증 상태 확인 ───────────────────────
+        # ── Logout / unlink saved account ────────
+        if cmd == "/logout":
+            _clear_auth_token()
+            self.copilot._github_token = None
+            self.copilot._copilot_token = None
+            return (
+                "✅ Logged out. Saved GitHub account has been unlinked.\n"
+                "  Run /auth to link a new account."
+            )
+
+        # ── Auth status ──────────────────────────
         if cmd == "/status":
             return self.copilot.get_status()
 
-        # ── 모델 선택 ────────────────────────────
+        # ── Model selection ──────────────────────
         if cmd == "/models":
             models = self.copilot.list_models()
             current = self.copilot.get_model()
 
             if arg1:
-                # 번호 또는 이름으로 모델 선택
+                # Select by number or name
                 try:
                     idx = int(arg1) - 1
                     if 0 <= idx < len(models):
                         selected = models[idx]
                         self.copilot.set_model(selected)
                         self._save_state()
-                        return f"✅ 모델이 '{selected}'으로 변경되었습니다."
-                    return f"[오류] 유효하지 않은 번호입니다. 1~{len(models)} 사이로 입력하세요."
+                        return f"✅ Model changed to '{selected}'."
+                    return f"[Error] Invalid number. Enter a value between 1 and {len(models)}."
                 except ValueError:
-                    # 이름으로 선택
+                    # Select by name
                     if arg1 in models:
                         self.copilot.set_model(arg1)
                         self._save_state()
-                        return f"✅ 모델이 '{arg1}'으로 변경되었습니다."
-                    return f"[오류] 모델을 찾을 수 없습니다: {arg1}\n/models 로 목록을 확인하세요."
+                        return f"✅ Model changed to '{arg1}'."
+                    return f"[Error] Model not found: {arg1}\nRun /models to see available models."
 
-            # 모델 목록 출력
-            lines = ["사용 가능한 Copilot 모델:"]
+            # List models
+            lines = ["Available Copilot models:"]
             for i, model in enumerate(models, 1):
-                marker = " ◀ 현재 선택" if model == current else ""
+                marker = "  ◀ current" if model == current else ""
                 lines.append(f"  {i}. {model}{marker}")
-            lines.append(f"\n선택하려면: /models <번호 또는 모델명>")
+            lines.append("\nTo select: /models <number or name>")
             if not self.copilot.is_authenticated():
-                lines.append("  (인증 후에는 API에서 실제 지원 모델을 조회합니다)")
+                lines.append("  (after authenticating, the live model list will be fetched from the API)")
             return "\n".join(lines)
 
-        # ── 새 대화 ──────────────────────────────
+        # ── New conversation ─────────────────────
         if cmd == "/new":
             self.memory.clear_short_term()
-            return "🆕 새 대화를 시작합니다. (단기 기억 초기화됨, 장기 기억은 유지됩니다)"
+            return "🆕 New conversation started. (Short-term memory cleared; long-term memory retained.)"
 
-        # ── 전체 초기화 ──────────────────────────
+        # ── Full reset ───────────────────────────
         if cmd == "/reset":
             if not _confirm(
-                "⚠️  모든 장기 기억, 현재 대화, 모델 설정이 초기화됩니다. 계속하겠습니까?"
+                "⚠️  All long-term memory, conversation history, and model settings will be cleared. Continue?"
             ):
-                return "취소되었습니다."
+                return "Cancelled."
             self.memory.clear_short_term()
             self.memory.clear_long_term()
             self.copilot.set_model(COPILOT_DEFAULT_MODEL)
-            # 상태 파일 삭제
             if os.path.exists(STATE_FILE):
                 try:
                     os.remove(STATE_FILE)
                 except OSError:
                     pass
             return (
-                "✅ 초기화 완료!\n"
-                f"  - 장기 기억(sapiens_memory.json) 삭제\n"
-                f"  - 대화 내역(단기 기억) 초기화\n"
-                f"  - 모델이 '{COPILOT_DEFAULT_MODEL}'으로 초기화됨"
+                "✅ Reset complete!\n"
+                f"  - Long-term memory (sapiens_memory.json) deleted\n"
+                f"  - Conversation history (short-term memory) cleared\n"
+                f"  - Model reset to '{COPILOT_DEFAULT_MODEL}'"
             )
 
-        # ── 장기 기억 확인 ───────────────────────
+        # ── Long-term memory view ─────────────────
         if cmd == "/memory":
             display = self.memory.get_display()
-            return f"[장기 기억]\n{display}"
+            return f"[Long-Term Memory]\n{display}"
 
-        # ── 파일 시스템 ─────────────────────────
+        # ── File system ──────────────────────────
         if cmd == "/pwd":
-            return f"현재 폴더: {self.system.get_cwd()}"
+            return f"Working directory: {self.system.get_cwd()}"
 
         if cmd == "/cd":
             if not arg1:
-                return "[오류] 사용법: /cd <경로>"
+                return "[Error] Usage: /cd <path>"
             return self.system.change_dir(arg1)
 
         if cmd == "/ls":
@@ -1088,15 +1220,15 @@ class AgentCore:
 
         if cmd == "/cat":
             if not arg1:
-                return "[오류] 사용법: /cat <파일>"
+                return "[Error] Usage: /cat <file>"
             return self.system.read_file(arg1)
 
         if cmd == "/write":
             if not arg1:
-                return "[오류] 사용법: /write <파일> <내용>"
+                return "[Error] Usage: /write <file> [content]"
             content = arg2
             if not content:
-                print(f"  '{arg1}'에 작성할 내용을 입력하세요 (Windows: Ctrl+Z+Enter, Unix: Ctrl+D 또는 'EOF'로 종료):")
+                print(f"  Enter content for '{arg1}' (type EOF on its own line to finish):")
                 lines = []
                 try:
                     while True:
@@ -1111,27 +1243,26 @@ class AgentCore:
 
         if cmd == "/rm":
             if not arg1:
-                return "[오류] 사용법: /rm <파일>"
+                return "[Error] Usage: /rm <file>"
             return self.system.delete_file(arg1)
 
-        # ── 실행 ────────────────────────────────
+        # ── Execution ────────────────────────────
         if cmd == "/run":
             if not arg1:
-                return "[오류] 사용법: /run <파일>"
+                return "[Error] Usage: /run <file>"
             return self.system.run_file(arg1)
 
         if cmd == "/exec":
             if not arg1:
-                return "[오류] 사용법: /exec <명령>"
+                return "[Error] Usage: /exec <command>"
             full_cmd = raw[len("/exec "):].strip()
             return self.system.exec_command(full_cmd)
 
-        # ── Copilot 코드 생성 ────────────────────
+        # ── Code generation ──────────────────────
         if cmd == "/codegen":
             if not self.copilot.is_authenticated():
-                return "❌ Copilot 인증이 필요합니다. /auth 를 먼저 실행하세요."
+                return "❌ Copilot authentication required. Run /auth first."
 
-            # 전체 입력에서 /codegen 이후 부분을 가져와 --lang 플래그 파싱
             codegen_args = raw[len("/codegen"):].strip()
             lang = "python"
             if "--lang" in codegen_args:
@@ -1142,24 +1273,24 @@ class AgentCore:
                     lang = lang_value
 
             if not codegen_args:
-                return "[오류] 사용법: /codegen <코드 설명> [--lang <언어>]"
+                return "[Error] Usage: /codegen <description> [--lang <language>]"
 
-            print(f"  Copilot에게 {lang} 코드를 요청 중...")
+            print(f"  Requesting {lang} code from Copilot...")
             code = self.copilot.generate_code(codegen_args, language=lang)
             if code:
-                return f"생성된 코드:\n\n{code}"
-            return "❌ 코드 생성 실패."
+                return f"Generated code:\n\n{code}"
+            return "❌ Code generation failed."
 
-        # ── 도움말 ───────────────────────────────
+        # ── Help ─────────────────────────────────
         if cmd in ("/help", "/?"):
             return _help_text()
 
-        # ── 종료 ────────────────────────────────
+        # ── Exit ─────────────────────────────────
         if cmd in ("/exit", "/quit", "/q"):
-            print("Sapiens2.0을 종료합니다. 안녕히 가세요! 👋")
+            print("Goodbye! 👋")
             sys.exit(0)
 
-        return f"[오류] 알 수 없는 명령: {cmd}\n/help 를 입력하면 명령어 목록을 볼 수 있습니다."
+        return f"[Error] Unknown command: {cmd}\nType /help to see all available commands."
 
 
 # ─────────────────────────────────────────────
@@ -1223,137 +1354,275 @@ def _run_subprocess(cmd: Union[str, List[str]], cwd: str = ".", shell: bool = Fa
         return f"[오류] 실행 권한이 없습니다: {e}"
 
 
+# ─────────────────────────────────────────────
+#  Utility functions
+# ─────────────────────────────────────────────
+
+def _confirm(message: str) -> bool:
+    """
+    Ask the user for a yes/no confirmation.
+
+    Returns:
+        True if the user confirms (y/yes), False otherwise.
+    """
+    try:
+        answer = input(f"{message} [y/N] ").strip().lower()
+        return answer in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def _run_subprocess(cmd: Union[str, List[str]], cwd: str = ".", shell: bool = False, timeout: int = 30) -> str:
+    """
+    Run a subprocess and return its combined stdout/stderr output.
+
+    Args:
+        cmd: Command to run (string or list).
+        cwd: Working directory.
+        shell: If True, run via the system shell.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        Combined stdout + stderr string.
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            shell=shell,
+            timeout=timeout,
+        )
+        output_parts = []
+        if result.stdout.strip():
+            output_parts.append(result.stdout.strip())
+        if result.stderr.strip():
+            output_parts.append(f"[stderr]\n{result.stderr.strip()}")
+        if result.returncode != 0:
+            output_parts.append(f"[exit code: {result.returncode}]")
+
+        return "\n".join(output_parts) if output_parts else "(no output)"
+
+    except subprocess.TimeoutExpired:
+        return f"[Error] Command timed out ({timeout}s)"
+    except FileNotFoundError as e:
+        return f"[Error] Command or file not found: {e}"
+    except PermissionError as e:
+        return f"[Error] Permission denied: {e}"
+
+
+def _build_agent_system_prompt(lt_context: str = "") -> str:
+    """
+    Build the system prompt for the agentic chat loop.
+    Explicitly informs the model of its computer control capabilities and the
+    tool-call format it must use to actually execute commands.
+    """
+    parts = [
+        "You are Sapiens2.0, an AI agent with DIRECT computer control capabilities.\n"
+        "\n"
+        "IMPORTANT: You can control the user's computer right now. When asked to inspect "
+        "files, navigate directories, run commands, or perform any local task, you MUST "
+        "use the tools below — do not just describe what to do, ACTUALLY DO IT.\n"
+        "\n"
+        "HOW TO USE COMPUTER CONTROL TOOLS:\n"
+        "Include tool calls in your response using this exact format:\n"
+        "  <tool>/command args</tool>\n"
+        "These are executed automatically; results are fed back to you.\n"
+        "\n"
+        "AVAILABLE TOOLS:\n"
+        "  <tool>/pwd</tool>                   — show current working directory\n"
+        "  <tool>/ls</tool>                    — list current directory contents\n"
+        "  <tool>/ls path/to/dir</tool>        — list a specific directory\n"
+        "  <tool>/cat filename</tool>           — read a file's contents\n"
+        "  <tool>/cd path/to/dir</tool>         — change working directory\n"
+        "  <tool>/exec shell_command</tool>     — run any shell/PowerShell command\n"
+        "  <tool>/run script.py</tool>          — execute a Python script\n"
+        "\n"
+        "EXAMPLES:\n"
+        "  User: 'what files are in this folder?' → <tool>/ls</tool>\n"
+        "  User: 'show me the README'             → <tool>/cat README.md</tool>\n"
+        "  User: 'what Python version?'           → <tool>/exec python --version</tool>\n"
+        "  User: 'run the tests'                  → <tool>/exec python -m pytest</tool>\n"
+        "  User: 'go to my Desktop'               → <tool>/cd ~/Desktop</tool>\n"
+        "\n"
+        "RULES:\n"
+        "1. For any task involving files, directories, or commands, ALWAYS use the tools.\n"
+        "2. You may chain multiple tool calls in one response.\n"
+        "3. File write and delete operations (/write, /rm) require user confirmation;\n"
+        "   they cannot be executed automatically from within the agent loop.\n"
+        "4. Always show what you are doing before doing it.\n"
+        "5. After seeing tool results, give a concise natural language summary.\n"
+        "6. Answer in the same language the user writes in.",
+    ]
+
+    if lt_context:
+        parts.append(f"\n{lt_context}")
+
+    return "\n".join(parts)
+
+
 def _help_text() -> str:
-    """도움말 텍스트를 반환합니다."""
+    """Return the help text string."""
     return textwrap.dedent("""\
-        ╔══════════════════════════════════════════╗
-        ║          Sapiens2.0 명령어 도움말          ║
-        ╚══════════════════════════════════════════╝
+        ╔══════════════════════════════════════════════════╗
+        ║              Sapiens2.0  —  Help                 ║
+        ╚══════════════════════════════════════════════════╝
 
-        [인증] — OpenClaw 방식 (GitHub device flow)
-          /auth                GitHub device flow 인증 시작 (권장)
-                               → 터미널에 표시된 코드를 확인하고
-                                 https://github.com/login/device 에서 입력
-          /auth <token>        GitHub PAT/OAuth 토큰 직접 설정
-          /status              현재 GitHub/Copilot 인증 상태 및 선택 모델 확인
+        INSTALLATION (run once):
+          pip install -e .           Install — makes 'sapiens' command available globally
+          sapiens wakeup             Start Sapiens2.0 from any terminal/PowerShell window
 
-        [모델 선택]
-          /models              사용 가능한 Copilot 모델 목록 출력
-          /models <번호>       번호로 모델 선택 (예: /models 2)
-          /models <이름>       모델명으로 선택 (예: /models gpt-4o-mini)
+        AUTHENTICATION (GitHub device flow — same as OpenClaw):
+          /auth                Start GitHub device flow (recommended)
+                               → note the code shown, visit https://github.com/login/device
+                                 and enter it to approve; your account is saved automatically
+          /auth <token>        Provide a GitHub PAT/OAuth token directly (also saved)
+          /logout              Unlink the saved GitHub account
+          /status              Show current auth and token status
 
-        [대화 / 기억]
-          /new                 새 대화 시작 (단기 기억 초기화, 장기 기억 유지)
-          /reset               전체 초기화 (장기 기억·모델 설정 포함, 확인 필요)
-          /memory              현재 장기 기억 내용 출력
+        MODEL SELECTION:
+          /models              List available Copilot models
+          /models <number>     Select model by number  (e.g. /models 2)
+          /models <name>       Select model by name    (e.g. /models gpt-4o-mini)
 
-        [파일 시스템]
-          /pwd                 현재 작업 디렉토리 출력
-          /cd <경로>           작업 디렉토리 변경
-          /ls [경로]           디렉토리 목록 출력
-          /cat <파일>          파일 내용 출력
-          /write <파일> [내용] 파일 작성 (내용 생략 시 입력 모드)
-          /rm <파일>           파일 삭제 (확인 필요)
+        CONVERSATION & MEMORY:
+          /new                 Start a new conversation (clears short-term memory; long-term kept)
+          /reset               Full reset: clears long-term memory + model settings (with confirm)
+          /memory              Display current long-term memory contents
 
-        [실행]
-          /run <파일>          Python/스크립트 파일 실행
-          /exec <명령>         셸 명령 실행
+        COMPUTER CONTROL (direct commands):
+          /pwd                 Show current working directory
+          /cd <path>           Change working directory
+          /ls [path]           List directory contents
+          /cat <file>          Read and display a file
+          /write <file> [text] Write to a file (prompts for content if text omitted)
+          /rm <file>           Delete a file (requires confirmation)
+          /run <file>          Execute a Python script
+          /exec <cmd>          Run a shell/PowerShell command
 
-        [Copilot 연동]
-          /codegen <설명> [--lang <언어>]   설명을 기반으로 코드 생성 (기본: python)
+        COMPUTER CONTROL (via conversation):
+          Just ask naturally! The agent will automatically use the tools above.
+          Examples:
+            "what files are in this folder?"
+            "show me the contents of README.md"
+            "what Python version am I running?"
+            "run the tests"
+            "create a file called hello.py that prints Hello World"
 
-        [기타]
-          /help  또는  /?      이 도움말 출력
-          /exit  또는  /quit   프로그램 종료
+        CODE GENERATION:
+          /codegen <description> [--lang <language>]
+                               Generate code using Copilot (default language: python)
 
-        슬래시 명령 외 일반 텍스트 입력은 Copilot과의 대화로 처리됩니다.
-        (Copilot 인증 필요 / 대화 내역은 단기 기억으로 자동 유지됨)
+        OTHER:
+          /help  or  /?        Show this help text
+          /exit  or  /quit     Exit Sapiens2.0
 
-        [기억 구조]
-          단기 기억 : 현재 세션 대화 내역. /new 또는 세션 종료 시 초기화.
-          장기 기억 : sapiens_memory.json 파일에 저장. 세션 간 유지.
-                     에이전트가 대화 중 중요한 정보를 자동으로 장기 기억에 저장합니다.
+        MEMORY SYSTEM:
+          Short-term : Current session conversation history.
+                       Cleared on /new or exit.
+          Long-term  : sapiens_memory.json — persists across sessions.
+                       The agent automatically extracts and saves important facts.
+                       Cleared only on /reset.
 
-        [PowerShell 실행 예시]
-          python .\\main.py
-          python .\\main.py --token ghp_xxxx...
-
-        [인증 흐름 예시 (PowerShell)]
-          PS> python .\\main.py
-          [사용자] /auth
-          [Sapiens2.0] GitHub device flow 인증을 시작합니다...
-          [Sapiens2.0] URL  : https://github.com/login/device
-          [Sapiens2.0] 코드 : ABCD-1234
-          → 브라우저에서 위 URL을 열고 코드를 입력·승인하면 자동으로 인증됩니다.
+        PERSISTENT AUTH:
+          After your first /auth, your GitHub account is saved to ~/.sapiens2/config.json.
+          The next time you run 'sapiens wakeup', you are automatically logged in —
+          no need to re-authenticate unless you run /logout.
     """)
 
 
 # ─────────────────────────────────────────────
-#  진입점
+#  Entry points
 # ─────────────────────────────────────────────
 
-def main():
-    """Sapiens2.0 에이전트를 시작합니다."""
+def _print_banner(agent: "AgentCore") -> None:
+    """Print the Sapiens2.0 startup logo and status information."""
+    print()
+    print("  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║                                                          ║")
+    print("  ║   ____             _                 ____   ___          ║")
+    print("  ║  / ___|  __ _ _ __|_) ___ _ __  ___ |___ \\ / _ \\        ║")
+    print("  ║  \\___ \\ / _` | '_ \\ |/ _ \\ '_ \\/ __|  __) | | |        ║")
+    print("  ║   ___) | (_| | |_) | |  __/ | | \\__ \\ / __/| |_|        ║")
+    print("  ║  |____/ \\__,_| .__/|_|\\___|_| |_|___/|_____|\\___/       ║")
+    print("  ║              |_|                                          ║")
+    print("  ║                                                          ║")
+    print("  ║  AI Agent  ·  Computer Control  ·  Long-Term Memory      ║")
+    print("  ║  GitHub Copilot powered  ·  v2.0                         ║")
+    print("  ║                                                          ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    print()
+
+    # Auth status
+    if agent.copilot.is_authenticated():
+        saved = os.path.exists(AUTH_CONFIG_FILE)
+        note = "  (saved — auto-login enabled)" if saved else ""
+        print(f"  ✅ GitHub account linked{note}")
+    else:
+        print("  ℹ️  Not authenticated. Type /auth to link your GitHub account.")
+        print("     Visit https://github.com/login/device and enter the code shown.")
+
+    # Long-term memory
+    lt_mem = agent.memory.get_long_term()
+    if lt_mem:
+        print(f"  💾 Long-term memory: {len(lt_mem)} entries loaded  (/memory to view)")
+
+    # Model
+    print(f"  🤖 Model: {agent.copilot.get_model()}  (/models to change)")
+    print()
+    print("  Type /help to see all commands. Type your message to start chatting.")
+    print()
+
+
+def main() -> None:
+    """Start the Sapiens2.0 agent (interactive session)."""
     parser = argparse.ArgumentParser(
-        description="Sapiens2.0 - AI Agent (GitHub Copilot 연동)",
+        description="Sapiens2.0 - AI Agent with Computer Control",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
-            예시 (PowerShell):
-              python .\\main.py                    # 기본 실행 후 /auth 로 device flow 인증
-              python .\\main.py --token ghp_xxx... # PAT/OAuth 토큰 직접 지정
+            Quick start (PowerShell / terminal):
+              pip install -e .       Install once to get the 'sapiens' command
+              sapiens wakeup         Start from any directory
 
-            인증 흐름 (OpenClaw 방식):
-              1. python .\\main.py 실행
-              2. /auth 입력
-              3. 터미널에 표시된 코드 확인
-              4. 브라우저에서 https://github.com/login/device 열고 코드 입력·승인
-              5. 터미널에 ✅ 인증 성공 표시 → Copilot 사용 시작
+            Or run directly from the project folder:
+              python main.py
+
+            Authentication:
+              1. Start Sapiens2.0
+              2. Type: /auth
+              3. Note the code shown in the terminal
+              4. Open https://github.com/login/device in your browser and enter the code
+              5. Your account is saved — no need to re-authenticate next time
         """),
     )
     parser.add_argument(
         "--token",
         metavar="GITHUB_TOKEN",
         default=os.environ.get("GITHUB_TOKEN"),
-        help="GitHub OAuth/PAT 토큰 (환경변수 GITHUB_TOKEN도 인식). device flow 대신 토큰을 직접 지정할 때 사용.",
+        help="GitHub OAuth/PAT token (overrides saved auth and GITHUB_TOKEN env var).",
     )
     parser.add_argument(
         "--client-id",
         metavar="CLIENT_ID",
         default=DEFAULT_CLIENT_ID,
         help=(
-            "GitHub OAuth App Client ID (기본값: GitHub CLI 공개 앱). "
-            "직접 등록한 OAuth App을 사용하려면 이 값을 지정하세요. "
-            "GitHub OAuth App 등록: https://github.com/settings/developers"
+            "GitHub OAuth App Client ID (default: GitHub CLI public app). "
+            "Only needed if you registered your own OAuth App at "
+            "https://github.com/settings/developers"
         ),
     )
     args = parser.parse_args()
 
-    # 에이전트 초기화
     agent = AgentCore(github_token=args.token, client_id=args.client_id)
+    _print_banner(agent)
 
-    print("=" * BANNER_WIDTH)
-    print("  Sapiens2.0 AI Agent - 프로토타입 v2.0")
-    print("=" * BANNER_WIDTH)
-    print("  /help 를 입력하면 명령어 목록을 볼 수 있습니다.")
-    if args.token:
-        print("  ✅ GitHub 토큰이 설정되었습니다.")
-    else:
-        print("  ℹ️  Copilot 연동을 시작하려면 /auth 를 입력하세요.")
-        print("     브라우저에서 https://github.com/login/device 에 접속해")
-        print("     터미널에 표시된 코드를 입력하면 자동으로 인증됩니다.")
-    lt_mem = agent.memory.get_long_term()
-    if lt_mem:
-        print(f"  💾 장기 기억 {len(lt_mem)}개 항목이 로드되었습니다. (/memory 로 확인)")
-    print(f"  🤖 선택된 모델: {agent.copilot.get_model()} (/models 로 변경)")
-    print("=" * BANNER_WIDTH)
-    print()
-
-    # 대화 루프
+    # Interactive loop
     while True:
         try:
-            user_input = input("[사용자] ").strip()
+            user_input = input("[You] ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nSapiens2.0을 종료합니다. 안녕히 가세요! 👋")
+            print("\nGoodbye! 👋")
             break
 
         if not user_input:
@@ -1362,6 +1631,26 @@ def main():
         response = agent.process(user_input)
         if response:
             print(f"[Sapiens2.0] {response}\n")
+
+
+def cli_entry() -> None:
+    """
+    Entry point for the 'sapiens' console script installed by pip.
+
+    Usage:
+      sapiens wakeup          Start Sapiens2.0
+      sapiens wakeup --token  Start with a specific GitHub token
+    """
+    args = sys.argv[1:]
+
+    if not args or args[0] != "wakeup":
+        print("Usage: sapiens wakeup [--token GITHUB_TOKEN] [--client-id CLIENT_ID]")
+        print("       sapiens wakeup --help")
+        sys.exit(1)
+
+    # Strip 'wakeup' from argv and let argparse handle the rest
+    sys.argv = [sys.argv[0]] + args[1:]
+    main()
 
 
 if __name__ == "__main__":

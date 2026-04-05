@@ -9,7 +9,7 @@ build/
 .eggs/
 *.egg
 
-# 가상 환경
+# Virtual environments
 .venv/
 venv/
 env/
@@ -21,10 +21,13 @@ ENV/
 *.swp
 *.swo
 
-# 환경 변수
+# Environment variables
 .env
 .env.local
 
-# Sapiens2.0 사용자 데이터 (세션별로 생성되는 파일)
+# Sapiens2.0 user data (created at runtime)
 sapiens_memory.json
 sapiens_state.json
+
+# Installed package (editable install)
+sapiens2.egg-info/
