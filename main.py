@@ -187,6 +187,18 @@ MCP_MAX_CANDIDATES = 5
 # MCP JSON-RPC protocol version
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
+# Sapiens client version reported in the MCP initialize handshake
+_SAPIENS_VERSION = "2.0"
+
+# Maximum lines to read from MCP server stdout when waiting for a JSON-RPC response
+MCP_MAX_RESPONSE_LINES = 50
+
+# Regex for extracting npm package names from README install instructions
+_NPM_PACKAGE_RE = re.compile(r"npm install.*?([\w@][\w/.-]+)")
+
+# Max characters to include from stderr in error messages
+MCP_STDERR_MAX_CHARS = 300
+
 # Curated baseline registry of well-known, safe MCP servers.
 # Each entry is fully self-describing so the agent can install and run without
 # any additional lookup.  Extended at runtime by GitHub discovery.
@@ -1029,7 +1041,7 @@ class MCPRunner:
             line = json.dumps(req) + "\n"
             self._process.stdin.write(line.encode("utf-8"))
             self._process.stdin.flush()
-            for _ in range(50):
+            for _ in range(MCP_MAX_RESPONSE_LINES):
                 raw = self._process.stdout.readline()
                 if not raw:
                     break
@@ -1084,7 +1096,7 @@ class MCPRunner:
         init_resp = self._send("initialize", {
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
-            "clientInfo": {"name": "sapiens2", "version": "2.0"},
+            "clientInfo": {"name": "sapiens2", "version": _SAPIENS_VERSION},
         })
         if init_resp is None:
             self.stop()
@@ -1266,8 +1278,8 @@ class MCPModule:
                 "stars": item.get("stargazers_count", 0),
                 "url": item.get("html_url", ""),
                 "default_branch": item.get("default_branch", "main"),
-                "install_type": "npm",   # assumed; overridden if README says otherwise
-                "run_cmd": [],           # populated by install()
+                "install_type": "npm",
+                "run_cmd": [],
                 "tags": [],
                 "package": "",
             })
@@ -1385,7 +1397,7 @@ class MCPModule:
                                 hit["description"] = clean[:200]
                                 break
                     # Extract npm package name from README if present
-                    npm_match = re.search(r"npm install.*?([\w@][\w/.-]+)", readme)
+                    npm_match = _NPM_PACKAGE_RE.search(readme)
                     if npm_match:
                         hit["package"] = npm_match.group(1)
                 candidates.append(hit)
@@ -1394,7 +1406,7 @@ class MCPModule:
             print("[MCP] No candidates found.")
             return None
 
-        selected = self.select_best(goal, candidates[:MCP_MAX_CANDIDATES + len(MCP_CURATED_REGISTRY)])
+        selected = self.select_best(goal, candidates)
         if selected:
             print(
                 f"[MCP] Selected: {selected.get('name', '?')} — "
@@ -1471,7 +1483,7 @@ class MCPModule:
                     if result.returncode != 0:
                         print(
                             f"[MCP] Warning: npm install failed (npx will handle it on first use):\n"
-                            f"  {result.stderr.strip()[:300]}"
+                            f"  {result.stderr.strip()[:MCP_STDERR_MAX_CHARS]}"
                         )
                     else:
                         print(f"[MCP] npm install succeeded.")
@@ -1492,7 +1504,7 @@ class MCPModule:
                     timeout=120,
                 )
                 if result.returncode != 0:
-                    return False, f"pip install failed:\n{result.stderr.strip()[:400]}"
+                    return False, f"pip install failed:\n{result.stderr.strip()[:MCP_STDERR_MAX_CHARS]}"
                 print("[MCP] pip install succeeded.")
             except subprocess.TimeoutExpired:
                 return False, "pip install timed out."
@@ -1755,7 +1767,10 @@ class AgentCore:
             try:
                 arguments = json.loads(json_args_str)
             except json.JSONDecodeError:
-                arguments = {"input": json_args_str}
+                return (
+                    f"[MCP Error] Invalid JSON arguments for /mcp-call: {json_args_str!r}\n"
+                    "  Provide valid JSON, e.g.: {\"path\": \"README.md\"}"
+                )
             return self.mcp.call_tool(mcp_name, tool_name, arguments)
         else:
             return f"[Error] Unknown tool: {cmd}"
