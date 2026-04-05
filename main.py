@@ -2800,7 +2800,7 @@ class DiscordBot:
 
             # Split response into chunks that fit within Discord's message limit
             chunks = [
-                response[i : i + self._MAX_CHARS]
+                response[i:i + self._MAX_CHARS]
                 for i in range(0, len(response), self._MAX_CHARS)
             ]
             for idx, chunk in enumerate(chunks):
@@ -3008,8 +3008,7 @@ def main() -> None:
             # Stop the spinner if it is still running (it uses a daemon thread
             # so it will be cleaned up automatically, but we want to clear the
             # indicator line immediately for clean UX).
-            print("\n\n  [Cancelled] Response generation stopped.  "
-                  "(Ctrl+C)\n")
+            print("\n\n  [Cancelled] Response generation stopped.  (Ctrl+C)\n")
             continue
 
         response = result_box[0]
