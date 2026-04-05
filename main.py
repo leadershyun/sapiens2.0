@@ -32,6 +32,7 @@ Key Commands:
   /models [num|name]    List or select available Copilot models
   /new                  Start a new conversation (short-term memory cleared)
   /reset                Full reset: long-term memory + model settings cleared
+  /update               Update Sapiens2.0 to the latest code automatically
   /memory               View long-term memory contents
   /pwd                  Print current working directory
   /ls [path]            List directory contents
@@ -816,12 +817,8 @@ class SystemCommandModule:
             return f"[Error] Permission denied: {target}"
 
     def write_file(self, path: str, content: str) -> str:
-        """Write content to a file. Asks for confirmation if the file already exists."""
+        """Write content to a file."""
         target = os.path.abspath(os.path.join(self._cwd, path))
-
-        if os.path.exists(target):
-            if not _confirm(f"⚠️  '{target}' already exists. Overwrite?"):
-                return "Cancelled."
 
         try:
             dirname = os.path.dirname(target)
@@ -851,16 +848,12 @@ class SystemCommandModule:
             return "[Error] Cannot delete a directory with /rm. Use rmdir."
 
     def run_file(self, path: str) -> str:
-        """Run a Python script or shell script. Warns before executing dangerous file types."""
+        """Run a Python script or shell script."""
         target = os.path.abspath(os.path.join(self._cwd, path))
         if not os.path.isfile(target):
             return f"[Error] File not found: {target}"
 
         ext = os.path.splitext(target)[1].lower()
-
-        if ext in DANGEROUS_EXTENSIONS:
-            if not _confirm(f"⚠️  '{target}' is a potentially dangerous file type. Run anyway?"):
-                return "Cancelled."
 
         if ext == ".py":
             cmd = [sys.executable, target]
@@ -1285,6 +1278,10 @@ class AgentCore:
         if cmd in ("/help", "/?"):
             return _help_text()
 
+        # ── Update ───────────────────────────────
+        if cmd == "/update":
+            return self._do_update()
+
         # ── Exit ─────────────────────────────────
         if cmd in ("/exit", "/quit", "/q"):
             print("Goodbye! 👋")
@@ -1292,66 +1289,78 @@ class AgentCore:
 
         return f"[Error] Unknown command: {cmd}\nType /help to see all available commands."
 
+    def _do_update(self) -> str:
+        """
+        Update Sapiens2.0 to the latest code by running git pull in the
+        installation directory, then re-running pip install to pick up any
+        new dependencies.
 
-# ─────────────────────────────────────────────
-#  유틸리티 함수
-# ─────────────────────────────────────────────
+        Returns:
+            Status message describing what happened.
+        """
+        script_dir = os.path.dirname(os.path.abspath(__file__))
 
-def _confirm(message: str) -> bool:
-    """
-    사용자에게 예/아니오 확인을 요청합니다.
+        if not os.path.isdir(os.path.join(script_dir, ".git")):
+            return (
+                "[Update] Cannot auto-update: the installation directory is not a git repository.\n"
+                f"  Location: {script_dir}\n"
+                "  To update manually, download the latest code from GitHub and\n"
+                "  run: pip install -e ."
+            )
 
-    Args:
-        message: 확인 메시지
+        print("[Update] Pulling latest code from GitHub...")
+        try:
+            git_result = subprocess.run(
+                ["git", "pull"],
+                capture_output=True,
+                text=True,
+                cwd=script_dir,
+                timeout=60,
+            )
+        except FileNotFoundError:
+            return (
+                "[Update] git command not found.\n"
+                "  Please install Git (https://git-scm.com) or update manually:\n"
+                "  1. Download the latest code from GitHub\n"
+                "  2. Run: pip install -e ."
+            )
+        except subprocess.TimeoutExpired:
+            return "[Update] git pull timed out. Check your network connection and try again."
 
-    Returns:
-        True: 사용자가 확인(y/yes), False: 취소(n/no 또는 기타)
-    """
-    try:
-        answer = input(f"{message} [y/N] ").strip().lower()
-        return answer in ("y", "yes", "예", "응")
-    except (EOFError, KeyboardInterrupt):
-        return False
+        pull_parts = []
+        if git_result.stdout.strip():
+            pull_parts.append(git_result.stdout.strip())
+        if git_result.stderr.strip():
+            pull_parts.append(git_result.stderr.strip())
+        pull_text = "\n".join(pull_parts) if pull_parts else "Already up to date."
 
+        if git_result.returncode != 0:
+            return f"[Update] git pull failed:\n{pull_text}"
 
-def _run_subprocess(cmd: Union[str, List[str]], cwd: str = ".", shell: bool = False, timeout: int = 30) -> str:
-    """
-    서브프로세스를 실행하고 결과를 반환합니다.
+        print("[Update] Refreshing dependencies (pip install -e .) ...")
+        try:
+            pip_result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-e", ".", "-q"],
+                capture_output=True,
+                text=True,
+                cwd=script_dir,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            pip_result = None
 
-    Args:
-        cmd: 실행할 명령 (문자열 또는 리스트)
-        cwd: 작업 디렉토리
-        shell: True면 셸을 통해 실행
-        timeout: 타임아웃 (초)
-
-    Returns:
-        표준 출력 + 표준 에러 결합 문자열
-    """
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            shell=shell,
-            timeout=timeout,
+        lines = [f"[Update] {pull_text}"]
+        if pip_result is None:
+            lines.append("[Update] Warning: pip install timed out; dependencies may be out of date.")
+        elif pip_result.returncode != 0 and pip_result.stderr.strip():
+            lines.append(
+                f"[Update] Warning: pip install reported issues:\n  {pip_result.stderr.strip()}"
+            )
+        lines.append(
+            "\n[OK] Update complete! Restart Sapiens2.0 to apply any changes.\n"
+            "     Run: sapiens wakeup"
         )
-        output_parts = []
-        if result.stdout.strip():
-            output_parts.append(result.stdout.strip())
-        if result.stderr.strip():
-            output_parts.append(f"[stderr]\n{result.stderr.strip()}")
-        if result.returncode != 0:
-            output_parts.append(f"[종료 코드: {result.returncode}]")
-
-        return "\n".join(output_parts) if output_parts else "(출력 없음)"
-
-    except subprocess.TimeoutExpired:
-        return f"[오류] 명령 실행 시간 초과 ({timeout}초)"
-    except FileNotFoundError as e:
-        return f"[오류] 명령 또는 파일을 찾을 수 없습니다: {e}"
-    except PermissionError as e:
-        return f"[오류] 실행 권한이 없습니다: {e}"
+        return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
@@ -1515,6 +1524,7 @@ def _help_text() -> str:
                                Generate code using Copilot (default language: python)
 
         OTHER:
+          /update              Update Sapiens2.0 to the latest code (git pull + pip install)
           /help  or  /?        Show this help text
           /exit  or  /quit     Exit Sapiens2.0
 
@@ -1537,39 +1547,55 @@ def _help_text() -> str:
 # ─────────────────────────────────────────────
 
 def _print_banner(agent: "AgentCore") -> None:
-    """Print the Sapiens2.0 startup logo and status information."""
+    """Print the Sapiens2.0 startup banner (ASCII-only for PowerShell compatibility)."""
+
+    # Inner content width (characters between the | borders).
+    # All content strings are padded/truncated to exactly this width.
+    INNER = 60
+
+    def _bline(content: str = "") -> str:
+        """Return one box content line, padded to INNER chars."""
+        return "  |" + content.ljust(INNER) + "|"
+
+    border = "  +" + "=" * INNER + "+"
+
+    # ASCII art for "Sapiens" — trailing spaces intentionally stripped;
+    # _bline() pads every line to exactly INNER characters via ljust().
+    logo = [
+        "   ____             _                 ____   ___",
+        "  / ___|  __ _ _ __|_) ___ _ __  ___ |___ \\ / _ \\",
+        "  \\___ \\ / _` | '_ \\ |/ _ \\ '_ \\/ __|  __) | | |",
+        "   ___) | (_| | |_) | |  __/ | | \\__ \\ / __/| |_|",
+        "  |____/ \\__,_| .__/|_|\\___|_| |_|___/|_____|\\___/  2.0",
+        "              |_|",
+    ]
+
     print()
-    print("  ╔══════════════════════════════════════════════════════════╗")
-    print("  ║                                                          ║")
-    print("  ║   ____             _                 ____   ___          ║")
-    print("  ║  / ___|  __ _ _ __|_) ___ _ __  ___ |___ \\ / _ \\        ║")
-    print("  ║  \\___ \\ / _` | '_ \\ |/ _ \\ '_ \\/ __|  __) | | |        ║")
-    print("  ║   ___) | (_| | |_) | |  __/ | | \\__ \\ / __/| |_|        ║")
-    print("  ║  |____/ \\__,_| .__/|_|\\___|_| |_|___/|_____|\\___/       ║")
-    print("  ║              |_|                                          ║")
-    print("  ║                                                          ║")
-    print("  ║  AI Agent  ·  Computer Control  ·  Long-Term Memory      ║")
-    print("  ║  GitHub Copilot powered  ·  v2.0                         ║")
-    print("  ║                                                          ║")
-    print("  ╚══════════════════════════════════════════════════════════╝")
+    print(border)
+    print(_bline())
+    for art_line in logo:
+        print(_bline(art_line))
+    print(_bline())
+    print(_bline("  AI Agent  *  Computer Control  *  Long-Term Memory"))
+    print(_bline("  GitHub Copilot powered"))
+    print(_bline())
+    print(border)
     print()
 
-    # Auth status
+    # Auth status (plain text, no emoji that may misrender in PowerShell)
     if agent.copilot.is_authenticated():
         saved = os.path.exists(AUTH_CONFIG_FILE)
-        note = "  (saved — auto-login enabled)" if saved else ""
-        print(f"  ✅ GitHub account linked{note}")
+        note = "  (saved -- auto-login enabled)" if saved else ""
+        print(f"  [OK] GitHub account linked{note}")
     else:
-        print("  ℹ️  Not authenticated. Type /auth to link your GitHub account.")
-        print("     Visit https://github.com/login/device and enter the code shown.")
+        print("  [i]  Not authenticated. Type /auth to link your GitHub account.")
+        print("       Visit https://github.com/login/device and enter the code shown.")
 
-    # Long-term memory
     lt_mem = agent.memory.get_long_term()
     if lt_mem:
-        print(f"  💾 Long-term memory: {len(lt_mem)} entries loaded  (/memory to view)")
+        print(f"  [M]  Long-term memory: {len(lt_mem)} entries loaded  (/memory to view)")
 
-    # Model
-    print(f"  🤖 Model: {agent.copilot.get_model()}  (/models to change)")
+    print(f"  [>]  Model: {agent.copilot.get_model()}  (/models to change)")
     print()
     print("  Type /help to see all commands. Type your message to start chatting.")
     print()
