@@ -76,7 +76,7 @@ Key Commands:
 
 Memory system:
   Short-term: session conversation history. Cleared on /new or exit.
-  Long-term:  sapiens_memory.json — persists across sessions. Cleared only on /reset.
+  Long-term:  ~/.sapiens2/sapiens_memory.json — persists across sessions. Cleared only on /reset.
               The agent automatically extracts and saves important facts from conversations.
 
 Computer control:
@@ -170,12 +170,6 @@ CONFIRM_REQUIRED_COMMANDS = {"rm", "del", "rmdir", "rd", "format", "mkfs", "dd"}
 # Banner width
 BANNER_WIDTH = 60
 
-# Long-term memory file path (relative to working directory)
-MEMORY_FILE = "sapiens_memory.json"
-
-# Agent state file (stores selected model, etc.)
-STATE_FILE = "sapiens_state.json"
-
 # Short-term memory max messages (older messages are pruned when exceeded)
 SHORT_TERM_MAX_MESSAGES = 20
 
@@ -192,9 +186,17 @@ AVAILABLE_MODELS = [
 # Copilot model list API endpoint
 COPILOT_MODELS_URL = "https://api.githubcopilot.com/models"
 
-# Persistent auth config (~/.sapiens2/config.json)
+# Persistent user-data directory — all user state lives here so it survives
+# restarts and "sapiens update" (git pull in the install directory).
 AUTH_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".sapiens2")
 AUTH_CONFIG_FILE = os.path.join(AUTH_CONFIG_DIR, "config.json")
+
+# Long-term memory file — stored in ~/.sapiens2/ alongside auth config so it
+# survives restarts, working-directory changes, and "sapiens update" (git pull).
+MEMORY_FILE = os.path.join(AUTH_CONFIG_DIR, "sapiens_memory.json")
+
+# Agent state file (model selection, etc.) — stored in ~/.sapiens2/ for the same reason.
+STATE_FILE = os.path.join(AUTH_CONFIG_DIR, "sapiens_state.json")
 
 # Regex to detect agent tool calls embedded in model responses
 # Format: <tool>/command args</tool>
@@ -358,7 +360,8 @@ class Spinner:
             self._thread.join(timeout=0.5)
         # Erase the spinner line so subsequent output starts cleanly
         clear_width = len(self._message) + 4
-        print(f"\r{' ' * clear_width}\r", end="", flush=True)
+        sys.stdout.write(f"\r{' ' * clear_width}\r")
+        sys.stdout.flush()
 
     # ── Context manager ──────────────────────
 
@@ -372,10 +375,13 @@ class Spinner:
 
     def _spin(self) -> None:
         idx = 0
-        while not self._stop_event.wait(self._INTERVAL):
+        while True:
             frame = self._FRAMES[idx % len(self._FRAMES)]
-            print(f"\r{self._message} {frame}", end="", flush=True)
+            sys.stdout.write(f"\r{self._message} {frame}")
+            sys.stdout.flush()
             idx += 1
+            if self._stop_event.wait(self._INTERVAL):
+                break
 
 
 # ─────────────────────────────────────────────
@@ -433,7 +439,7 @@ class MemoryModule:
       - Cleared on session exit or /new command
 
     Long-term memory:
-      - Stored as JSON in sapiens_memory.json
+      - Stored as JSON in ~/.sapiens2/sapiens_memory.json
       - Persists across sessions; cleared only on /reset
       - The agent automatically extracts important facts and stores them here
     """
@@ -475,6 +481,7 @@ class MemoryModule:
     def _save(self) -> None:
         """Save long-term memory to file."""
         try:
+            os.makedirs(os.path.dirname(self._memory_file), exist_ok=True)
             with open(self._memory_file, "w", encoding="utf-8") as f:
                 json.dump(self._long_term, f, ensure_ascii=False, indent=2)
         except IOError as e:
@@ -1702,10 +1709,10 @@ class AgentCore:
 
     Memory structure:
       - Short-term: MemoryModule._short_term (session conversation history)
-      - Long-term:  sapiens_memory.json (persists across sessions)
+      - Long-term:  ~/.sapiens2/sapiens_memory.json (persists across sessions)
 
     State file:
-      - sapiens_state.json: stores selected model and other settings
+      - ~/.sapiens2/sapiens_state.json: stores selected model and other settings
     """
 
     def __init__(self, github_token: Optional[str] = None, client_id: str = DEFAULT_CLIENT_ID):
@@ -1713,6 +1720,9 @@ class AgentCore:
         self.system = SystemCommandModule()
         self.memory = MemoryModule()
         self.client_id = client_id
+
+        # Tracks the active Spinner so Ctrl+C in the main loop can stop it cleanly
+        self._active_spinner: Optional[Spinner] = None
 
         # Load saved state (model selection, etc.)
         self._load_state()
@@ -1745,6 +1755,7 @@ class AgentCore:
     def _save_state(self) -> None:
         """Persist current agent state to disk."""
         try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
             state = {"model": self.copilot.get_model()}
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -1903,10 +1914,13 @@ class AgentCore:
 
         for _turn in range(5):  # max 5 tool-call iterations per turn
             # Show spinner while waiting for the Copilot API response
-            with Spinner():
+            spinner = Spinner()
+            self._active_spinner = spinner
+            with spinner:
                 response = self.copilot._call_copilot_api_messages(
                     system_prompt, messages, max_tokens=2048
                 )
+            self._active_spinner = None
             if not response:
                 return last_response or "[Error] No response received."
 
@@ -2036,7 +2050,7 @@ class AgentCore:
                     pass
             return (
                 "✅ Reset complete!\n"
-                f"  - Long-term memory (sapiens_memory.json) deleted\n"
+                f"  - Long-term memory (~/.sapiens2/sapiens_memory.json) deleted\n"
                 f"  - Conversation history (short-term memory) cleared\n"
                 f"  - Model reset to '{COPILOT_DEFAULT_MODEL}'"
             )
@@ -2631,7 +2645,7 @@ def _help_text() -> str:
         MEMORY SYSTEM:
           Short-term : Current session conversation history.
                        Cleared on /new or exit.
-          Long-term  : sapiens_memory.json — persists across sessions.
+          Long-term  : ~/.sapiens2/sapiens_memory.json — persists across sessions.
                        The agent automatically extracts and saves important facts.
                        Cleared only on /reset.
 
@@ -2990,8 +3004,8 @@ def main() -> None:
             continue
 
         # ── Chat messages run in a background thread so Ctrl+C can cancel ──
-        # The spinner is managed inside _run_agent_chat, not here, so the
-        # indicator is visible while the Copilot API is blocking.
+        # The spinner is managed inside _run_agent_chat via agent._active_spinner
+        # so it can be stopped cleanly from the Ctrl+C handler below.
         result_box: List[Optional[str]] = [None]
         done_event = threading.Event()
 
@@ -3005,9 +3019,12 @@ def main() -> None:
         try:
             done_event.wait()
         except KeyboardInterrupt:
-            # Stop the spinner if it is still running (it uses a daemon thread
-            # so it will be cleaned up automatically, but we want to clear the
-            # indicator line immediately for clean UX).
+            # Stop the active spinner immediately so it doesn't keep printing
+            # over the cancellation message or the next prompt.
+            active = agent._active_spinner
+            if active is not None:
+                active.stop()
+                agent._active_spinner = None
             print("\n\n  [Cancelled] Response generation stopped.  (Ctrl+C)\n")
             continue
 
