@@ -188,16 +188,22 @@ MCP_MAX_CANDIDATES = 5
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
 # Sapiens client version reported in the MCP initialize handshake
-_SAPIENS_VERSION = "2.0"
+SAPIENS_VERSION = "2.0"
 
 # Maximum lines to read from MCP server stdout when waiting for a JSON-RPC response
 MCP_MAX_RESPONSE_LINES = 50
 
 # Regex for extracting npm package names from README install instructions
-_NPM_PACKAGE_RE = re.compile(r"npm install.*?([\w@][\w/.-]+)")
+NPM_PACKAGE_RE = re.compile(r"npm install.*?([\w@][\w/.-]+)")
 
 # Max characters to include from stderr in error messages
 MCP_STDERR_MAX_CHARS = 300
+
+# Max characters to read from a GitHub README for MCP description extraction
+GITHUB_README_MAX_CHARS = 2000
+
+# Stop words excluded from MCP keyword scoring (common English words with no discriminating value)
+_MCP_SCORE_STOP_WORDS = {"", "a", "an", "the", "to", "for", "in", "of", "and", "or", "is", "on"}
 
 # Curated baseline registry of well-known, safe MCP servers.
 # Each entry is fully self-describing so the agent can install and run without
@@ -1029,7 +1035,7 @@ class MCPRunner:
     def _send(self, method: str, params: Optional[dict] = None) -> Optional[dict]:
         """
         Send a JSON-RPC 2.0 request to the MCP server and return the response.
-        Reads up to 50 lines of stdout looking for the matching response ID.
+        Reads up to MCP_MAX_RESPONSE_LINES lines of stdout looking for the matching response ID.
         """
         if not self._process:
             return None
@@ -1096,7 +1102,7 @@ class MCPRunner:
         init_resp = self._send("initialize", {
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
-            "clientInfo": {"name": "sapiens2", "version": _SAPIENS_VERSION},
+            "clientInfo": {"name": "sapiens2", "version": SAPIENS_VERSION},
         })
         if init_resp is None:
             self.stop()
@@ -1287,7 +1293,7 @@ class MCPModule:
 
     def fetch_readme(self, full_name: str) -> str:
         """
-        Fetch the README of a GitHub repository (up to 2000 characters).
+        Fetch the README of a GitHub repository (up to GITHUB_README_MAX_CHARS characters).
         Returns an empty string if the README cannot be retrieved.
         """
         try:
@@ -1299,7 +1305,7 @@ class MCPModule:
             if resp.status_code == 200:
                 raw_content = resp.json().get("content", "")
                 decoded = base64.b64decode(raw_content).decode("utf-8", errors="replace")
-                return decoded[:2000]
+                return decoded[:GITHUB_README_MAX_CHARS]
         except requests.RequestException:
             pass
         return ""
@@ -1348,7 +1354,7 @@ class MCPModule:
                         return candidates[idx]
 
         # Fallback: word-based scoring — pick candidate with the most tag words in the goal
-        goal_words = set(re.split(r"\W+", goal.lower())) - {"", "a", "the", "to", "for", "in"}
+        goal_words = set(re.split(r"\W+", goal.lower())) - _MCP_SCORE_STOP_WORDS
         best: Optional[dict] = None
         best_score = 0
         for c in candidates:
@@ -1397,7 +1403,7 @@ class MCPModule:
                                 hit["description"] = clean[:200]
                                 break
                     # Extract npm package name from README if present
-                    npm_match = _NPM_PACKAGE_RE.search(readme)
+                    npm_match = NPM_PACKAGE_RE.search(readme)
                     if npm_match:
                         hit["package"] = npm_match.group(1)
                 candidates.append(hit)
