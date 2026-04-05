@@ -1309,13 +1309,23 @@ class AgentCore:
             )
 
         print("[Update] Pulling latest code from GitHub...")
-        git_result = subprocess.run(
-            ["git", "pull"],
-            capture_output=True,
-            text=True,
-            cwd=script_dir,
-            timeout=60,
-        )
+        try:
+            git_result = subprocess.run(
+                ["git", "pull"],
+                capture_output=True,
+                text=True,
+                cwd=script_dir,
+                timeout=60,
+            )
+        except FileNotFoundError:
+            return (
+                "[Update] git command not found.\n"
+                "  Please install Git (https://git-scm.com) or update manually:\n"
+                "  1. Download the latest code from GitHub\n"
+                "  2. Run: pip install -e ."
+            )
+        except subprocess.TimeoutExpired:
+            return "[Update] git pull timed out. Check your network connection and try again."
 
         pull_parts = []
         if git_result.stdout.strip():
@@ -1328,16 +1338,21 @@ class AgentCore:
             return f"[Update] git pull failed:\n{pull_text}"
 
         print("[Update] Refreshing dependencies (pip install -e .) ...")
-        pip_result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-e", ".", "-q"],
-            capture_output=True,
-            text=True,
-            cwd=script_dir,
-            timeout=120,
-        )
+        try:
+            pip_result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-e", ".", "-q"],
+                capture_output=True,
+                text=True,
+                cwd=script_dir,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            pip_result = None
 
         lines = [f"[Update] {pull_text}"]
-        if pip_result.returncode != 0 and pip_result.stderr.strip():
+        if pip_result is None:
+            lines.append("[Update] Warning: pip install timed out; dependencies may be out of date.")
+        elif pip_result.returncode != 0 and pip_result.stderr.strip():
             lines.append(
                 f"[Update] Warning: pip install reported issues:\n  {pip_result.stderr.strip()}"
             )
@@ -1544,14 +1559,15 @@ def _print_banner(agent: "AgentCore") -> None:
 
     border = "  +" + "=" * INNER + "+"
 
-    # ASCII art for "Sapiens" — carefully aligned to INNER width
+    # ASCII art for "Sapiens" — trailing spaces intentionally stripped;
+    # _bline() pads every line to exactly INNER characters via ljust().
     logo = [
-        r"   ____              _                 ____   ___",
-        r"  / ___|  __ _ _ __ (_) ___ _ __  ___|___ \ / _ \ ",
-        r"  \___ \ / _` | '_ \| |/ _ \ '_ \/ __|__) | | |  ",
-        r"   ___) | (_| | |_) | |  __/ | | \__ \/ __/| |_|  ",
-        r"  |____/ \__,_| .__/|_|\___|_| |_|___/|_____|\___/  2.0",
-        r"              |_|",
+        "   ____              _                 ____   ___",
+        "  / ___|  __ _ _ __ (_) ___ _ __  ___|___ \\ / _ \\",
+        "  \\___ \\ / _` | '_ \\| |/ _ \\ '_ \\/ __|__) | | |",
+        "   ___) | (_| | |_) | |  __/ | | \\__ \\/ __/| |_|",
+        "  |____/ \\__,_| .__/|_|\\___|_| |_|___/|_____|\\___/  2.0",
+        "              |_|",
     ]
 
     print()
