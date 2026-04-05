@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sapiens2"
+version = "2.0.0"
+description = "Sapiens2.0 — AI Agent with Computer Control, Memory, and GitHub Copilot"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.28.0",
+]
+
+[project.scripts]
+sapiens = "main:cli_entry"
+
+[tool.setuptools]
+py-modules = ["main"]
