@@ -2,7 +2,8 @@
 Sapiens2.0 - AI Agent
 ======================
 An AI agent prototype with computer control, long-term memory, GitHub Copilot integration,
-and automatic MCP (Model Context Protocol) discovery, installation, and usage.
+automatic MCP (Model Context Protocol) discovery/installation/usage, a thinking indicator,
+Ctrl+C force-cancel support, and a Discord bot mode.
 
 Features:
   1. Conversational AI powered by GitHub Copilot
@@ -12,6 +13,9 @@ Features:
   5. Persistent GitHub account linkage across runs
   6. Automatic MCP discovery: the agent reads GitHub MCP descriptions, selects the best
      server for your goal, installs it, and uses it — all without manual configuration.
+  7. Thinking indicator: an ASCII spinner shows while Sapiens2.0 is preparing a response.
+  8. Force-cancel: press Ctrl+C during response generation to stop it cleanly.
+  9. Discord bot mode: run as a Discord bot with `sapiens wakeup --discord`.
 
 Installation & Usage:
   pip install -e .         # Install once — makes 'sapiens' command available globally
@@ -27,6 +31,21 @@ Authentication (OpenClaw style — GitHub device flow):
   4. Open https://github.com/login/device in your browser and enter the code
   5. Approve — Sapiens2.0 detects the approval automatically
   6. Your account is saved for future runs (no need to re-authenticate)
+
+Thinking indicator:
+  While Sapiens2.0 is preparing a reply, a spinning indicator is shown:
+    [Sapiens2.0] Thinking |
+  It animates on one line and is erased when the response begins printing.
+
+Cancel a response:
+  Press Ctrl+C while the response is being generated to cancel it.
+  The app recovers cleanly and shows the next prompt immediately.
+
+Discord bot mode:
+  pip install "discord.py>=2.0.0"
+  sapiens wakeup --discord --discord-token <BOT_TOKEN>
+  (or set DISCORD_BOT_TOKEN env var and omit --discord-token)
+  See README.md for full setup instructions.
 
 Key Commands:
   /auth                 Start GitHub device flow authentication (recommended)
@@ -76,14 +95,18 @@ MCP auto-discovery:
 
 Dependencies:
   pip install requests
+  pip install "discord.py>=2.0.0"  # optional — required only for Discord bot mode
 """
 
 import argparse
+import asyncio
 import base64
+import itertools
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import json
 import textwrap
@@ -94,6 +117,13 @@ try:
 except ImportError:
     print("[Error] 'requests' package is required. Run: pip install requests")
     sys.exit(1)
+
+try:
+    import discord
+    from discord.ext import commands as discord_commands
+    _DISCORD_AVAILABLE = True
+except ImportError:
+    _DISCORD_AVAILABLE = False
 
 # ─────────────────────────────────────────────
 #  Constants / Configuration
@@ -280,6 +310,72 @@ MCP_CURATED_REGISTRY: List[Dict] = [
         "repo": "modelcontextprotocol/servers",
     },
 ]
+
+
+# ─────────────────────────────────────────────
+#  Spinner: thinking/responding indicator
+# ─────────────────────────────────────────────
+
+class Spinner:
+    """
+    Lightweight ASCII spinner for PowerShell/terminal.
+
+    Displays an animated indicator on one line while Sapiens2.0 is
+    preparing a response.  Stops and clears the line cleanly when
+    done so that subsequent output is not disrupted.
+
+    Usage (context manager — preferred):
+        with Spinner("  [Sapiens2.0] Thinking"):
+            result = some_blocking_call()
+
+    Usage (manual):
+        s = Spinner().start()
+        result = some_blocking_call()
+        s.stop()
+    """
+
+    _FRAMES = ["|", "/", "-", "\\"]
+    _INTERVAL = 0.12  # seconds between frames
+
+    def __init__(self, message: str = "  [Sapiens2.0] Thinking") -> None:
+        self._message = message
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # ── Public API ───────────────────────────
+
+    def start(self) -> "Spinner":
+        """Start the spinner in a background daemon thread."""
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """Stop the spinner and erase the indicator line."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        # Erase the spinner line so subsequent output starts cleanly
+        clear_width = len(self._message) + 4
+        print(f"\r{' ' * clear_width}\r", end="", flush=True)
+
+    # ── Context manager ──────────────────────
+
+    def __enter__(self) -> "Spinner":
+        return self.start()
+
+    def __exit__(self, *_args: object) -> None:
+        self.stop()
+
+    # ── Private ──────────────────────────────
+
+    def _spin(self) -> None:
+        idx = 0
+        while not self._stop_event.wait(self._INTERVAL):
+            frame = self._FRAMES[idx % len(self._FRAMES)]
+            print(f"\r{self._message} {frame}", end="", flush=True)
+            idx += 1
 
 
 # ─────────────────────────────────────────────
@@ -1806,9 +1902,11 @@ class AgentCore:
         last_response = ""
 
         for _turn in range(5):  # max 5 tool-call iterations per turn
-            response = self.copilot._call_copilot_api_messages(
-                system_prompt, messages, max_tokens=2048
-            )
+            # Show spinner while waiting for the Copilot API response
+            with Spinner():
+                response = self.copilot._call_copilot_api_messages(
+                    system_prompt, messages, max_tokens=2048
+                )
             if not response:
                 return last_response or "[Error] No response received."
 
@@ -2501,6 +2599,30 @@ def _help_text() -> str:
 
           MCP state is persisted to: ~/.sapiens2/mcp_state.json
 
+        THINKING INDICATOR:
+          While Sapiens2.0 is preparing a response a spinning indicator
+            [Sapiens2.0] Thinking |
+          is shown on one line.  It stops and the line is cleared the moment
+          the response starts printing, so it never interferes with output.
+
+        CANCEL RESPONSE (force-stop):
+          Press Ctrl+C while Sapiens2.0 is generating a response to cancel it.
+          The current request is stopped and you are returned to the prompt.
+          Slash commands (/pwd, /ls, etc.) are not affected.
+
+        DISCORD BOT MODE:
+          Run Sapiens2.0 as a Discord bot:
+            sapiens wakeup --discord --discord-token <BOT_TOKEN>
+          Or set the env var and omit the flag:
+            set DISCORD_BOT_TOKEN=<BOT_TOKEN>
+            sapiens wakeup --discord
+
+          The bot responds to:
+            - Direct messages (DMs)
+            - @mentions in server channels
+
+          See README.md for full setup instructions.
+
         OTHER:
           /update              Update Sapiens2.0 to the latest code (git pull + pip install)
           /help  or  /?        Show this help text
@@ -2518,6 +2640,197 @@ def _help_text() -> str:
           The next time you run 'sapiens wakeup', you are automatically logged in —
           no need to re-authenticate unless you run /logout.
     """)
+
+
+
+# ─────────────────────────────────────────────
+#  Discord Bot Integration
+# ─────────────────────────────────────────────
+
+# Config key used in ~/.sapiens2/config.json to persist the Discord token
+_DISCORD_CONFIG_KEY = "discord_bot_token"
+
+
+def _save_discord_token(token: str) -> None:
+    """Persist the Discord bot token alongside the GitHub auth token."""
+    try:
+        os.makedirs(AUTH_CONFIG_DIR, exist_ok=True)
+        cfg: Dict[str, str] = {}
+        if os.path.exists(AUTH_CONFIG_FILE):
+            try:
+                with open(AUTH_CONFIG_FILE, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+            except (json.JSONDecodeError, OSError):
+                cfg = {}
+        cfg[_DISCORD_CONFIG_KEY] = token
+        with open(AUTH_CONFIG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+    except OSError:
+        pass
+
+
+def _load_discord_token() -> Optional[str]:
+    """Load a previously saved Discord bot token from config."""
+    try:
+        with open(AUTH_CONFIG_FILE, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        token = cfg.get(_DISCORD_CONFIG_KEY, "")
+        return token if token else None
+    except (OSError, json.JSONDecodeError, KeyError):
+        return None
+
+
+class DiscordBot:
+    """
+    Discord bot integration for Sapiens2.0.
+
+    Allows Sapiens2.0 to be used through Discord, similar in spirit to the
+    OpenClaw Discord integration.  The bot uses the same AgentCore instance
+    as the terminal so all settings, memory, and authentication are shared.
+
+    Activation:
+      sapiens wakeup --discord --discord-token <BOT_TOKEN>
+
+    Or set the environment variable first:
+      set DISCORD_BOT_TOKEN=<BOT_TOKEN>          # Windows PowerShell
+      export DISCORD_BOT_TOKEN=<BOT_TOKEN>       # bash / macOS
+
+    The bot responds to:
+      - Direct messages (DMs) — always.
+      - Server channel messages where the bot is @mentioned.
+
+    Each Discord channel maintains its own independent short-term memory so
+    conversations in different channels do not bleed into each other.
+    The shared long-term memory and settings are updated as normal.
+
+    Discord message length limit (2 000 chars) is handled automatically by
+    splitting long responses into consecutive messages.
+    """
+
+    _MAX_CHARS = 1990  # Discord hard limit is 2000; leave a small buffer
+
+    def __init__(self, agent: "AgentCore", token: str) -> None:
+        self._agent = agent
+        self._token = token
+        # Per-channel short-term memory so each channel has its own context
+        self._channel_memory: Dict[int, MemoryModule] = {}
+
+    # ── Public ───────────────────────────────
+
+    def run(self) -> None:
+        """Start the Discord bot (blocking)."""
+        if not _DISCORD_AVAILABLE:
+            print(
+                "[Discord] discord.py is not installed.\n"
+                "  Install it with:  pip install discord.py\n"
+                "  Then run:         sapiens wakeup --discord"
+            )
+            return
+
+        if not self._token:
+            print(
+                "[Discord] No bot token provided.\n"
+                "  Pass it with --discord-token <TOKEN>\n"
+                "  or set the DISCORD_BOT_TOKEN environment variable."
+            )
+            return
+
+        intents = discord.Intents.default()
+        intents.message_content = True
+        client = discord.Client(intents=intents)
+
+        @client.event
+        async def on_ready() -> None:  # type: ignore[misc]
+            print(f"[Discord] Sapiens2.0 online as {client.user}")
+            if client.user is not None:
+                print(
+                    f"[Discord] Add the bot to a server:\n"
+                    f"  https://discord.com/api/oauth2/authorize"
+                    f"?client_id={client.user.id}&permissions=2147483648&scope=bot"
+                )
+
+        @client.event
+        async def on_message(message: "discord.Message") -> None:  # type: ignore[misc]
+            # Never respond to the bot's own messages
+            if message.author == client.user:
+                return
+
+            is_dm = isinstance(message.channel, discord.DMChannel)
+            is_mentioned = client.user in message.mentions if client.user else False
+
+            if not (is_dm or is_mentioned):
+                return
+
+            # Strip the bot mention so only the user's actual text is processed
+            content = message.content
+            if client.user is not None:
+                content = content.replace(f"<@{client.user.id}>", "").strip()
+                content = content.replace(f"<@!{client.user.id}>", "").strip()
+
+            if not content:
+                await message.reply(
+                    "Hello! How can I help you?  "
+                    "Type a message or use `/help` to see available commands."
+                )
+                return
+
+            # Swap short-term memory to the per-channel memory so each channel
+            # maintains its own conversation context
+            channel_id = message.channel.id
+            if channel_id not in self._channel_memory:
+                self._channel_memory[channel_id] = MemoryModule()
+            original_memory = self._agent.memory
+            self._agent.memory = self._channel_memory[channel_id]
+
+            try:
+                # Show Discord typing indicator while the agent is working
+                async with message.channel.typing():
+                    # Run the blocking agent call in a thread pool so the
+                    # Discord event loop remains responsive
+                    loop = asyncio.get_event_loop()
+                    response = await loop.run_in_executor(
+                        None, self._agent.process, content
+                    )
+            finally:
+                # Restore the original terminal memory
+                self._agent.memory = original_memory
+
+            if not response:
+                return
+
+            # Split response into chunks that fit within Discord's message limit
+            chunks = [
+                response[i:i + self._MAX_CHARS]
+                for i in range(0, len(response), self._MAX_CHARS)
+            ]
+            for idx, chunk in enumerate(chunks):
+                if idx == 0:
+                    await message.reply(chunk)
+                else:
+                    await message.channel.send(chunk)
+
+        try:
+            client.run(self._token, log_handler=None)
+        except discord.LoginFailure:
+            print(
+                "[Discord] Login failed — check that the bot token is correct.\n"
+                "  Create or copy your token at https://discord.com/developers/applications"
+            )
+        except Exception as exc:
+            print(f"[Discord] Unexpected error: {exc}")
+
+
+def _run_discord_bot(agent: "AgentCore", token: Optional[str]) -> None:
+    """
+    Resolve the Discord token from the provided value, env var, or saved config,
+    then start the bot.
+    """
+    resolved = token or os.environ.get("DISCORD_BOT_TOKEN") or _load_discord_token()
+    if resolved and token:
+        # Persist a freshly supplied token for future runs
+        _save_discord_token(resolved)
+    bot = DiscordBot(agent=agent, token=resolved or "")
+    bot.run()
 
 
 # ─────────────────────────────────────────────
@@ -2583,11 +2896,12 @@ def _print_banner(agent: "AgentCore") -> None:
     print(f"  [>]  Model: {agent.copilot.get_model()}  (/models to change)")
     print()
     print("  Type /help to see all commands. Type your message to start chatting.")
+    print("  Tip: Press Ctrl+C while Sapiens2.0 is thinking to cancel the response.")
     print()
 
 
 def main() -> None:
-    """Start the Sapiens2.0 agent (interactive session)."""
+    """Start the Sapiens2.0 agent (interactive session or Discord bot mode)."""
     parser = argparse.ArgumentParser(
         description="Sapiens2.0 - AI Agent with Computer Control",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2604,7 +2918,11 @@ def main() -> None:
               2. Type: /auth
               3. Note the code shown in the terminal
               4. Open https://github.com/login/device in your browser and enter the code
-              5. Your account is saved — no need to re-authenticate next time
+              5. Your account is saved -- no need to re-authenticate next time
+
+            Discord bot mode:
+              sapiens wakeup --discord --discord-token <BOT_TOKEN>
+              (or set DISCORD_BOT_TOKEN env var and omit --discord-token)
         """),
     )
     parser.add_argument(
@@ -2623,23 +2941,77 @@ def main() -> None:
             "https://github.com/settings/developers"
         ),
     )
+    parser.add_argument(
+        "--discord",
+        action="store_true",
+        default=False,
+        help=(
+            "Run Sapiens2.0 as a Discord bot instead of starting the terminal interface. "
+            "Requires a bot token via --discord-token or the DISCORD_BOT_TOKEN env var."
+        ),
+    )
+    parser.add_argument(
+        "--discord-token",
+        metavar="DISCORD_BOT_TOKEN",
+        default=None,
+        help=(
+            "Discord bot token. Overrides the DISCORD_BOT_TOKEN env var and any "
+            "previously saved token."
+        ),
+    )
     args = parser.parse_args()
 
     agent = AgentCore(github_token=args.token, client_id=args.client_id)
+
+    # ── Discord bot mode ─────────────────────────────────────────────────────
+    if args.discord:
+        _run_discord_bot(agent, args.discord_token)
+        return
+
+    # ── Interactive terminal mode ────────────────────────────────────────────
     _print_banner(agent)
 
-    # Interactive loop
     while True:
         try:
             user_input = input("[You] ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye! 👋")
+            print("\nGoodbye!")
             break
 
         if not user_input:
             continue
 
-        response = agent.process(user_input)
+        # Slash commands run directly (they may prompt stdin for confirmations,
+        # so it is safer to keep them on the main thread).
+        if user_input.startswith("/"):
+            response = agent.process(user_input)
+            if response:
+                print(f"[Sapiens2.0] {response}\n")
+            continue
+
+        # ── Chat messages run in a background thread so Ctrl+C can cancel ──
+        # The spinner is managed inside _run_agent_chat, not here, so the
+        # indicator is visible while the Copilot API is blocking.
+        result_box: List[Optional[str]] = [None]
+        done_event = threading.Event()
+
+        def _work(ui: str = user_input) -> None:
+            result_box[0] = agent.process(ui)
+            done_event.set()
+
+        worker = threading.Thread(target=_work, daemon=True)
+        worker.start()
+
+        try:
+            done_event.wait()
+        except KeyboardInterrupt:
+            # Stop the spinner if it is still running (it uses a daemon thread
+            # so it will be cleaned up automatically, but we want to clear the
+            # indicator line immediately for clean UX).
+            print("\n\n  [Cancelled] Response generation stopped.  (Ctrl+C)\n")
+            continue
+
+        response = result_box[0]
         if response:
             print(f"[Sapiens2.0] {response}\n")
 
@@ -2649,13 +3021,16 @@ def cli_entry() -> None:
     Entry point for the 'sapiens' console script installed by pip.
 
     Usage:
-      sapiens wakeup          Start Sapiens2.0
-      sapiens wakeup --token  Start with a specific GitHub token
+      sapiens wakeup                          Start Sapiens2.0 (terminal mode)
+      sapiens wakeup --token <TOKEN>          Start with a specific GitHub token
+      sapiens wakeup --discord                Start in Discord bot mode
+      sapiens wakeup --discord --discord-token <BOT_TOKEN>
     """
     args = sys.argv[1:]
 
     if not args or args[0] != "wakeup":
         print("Usage: sapiens wakeup [--token GITHUB_TOKEN] [--client-id CLIENT_ID]")
+        print("       sapiens wakeup --discord [--discord-token DISCORD_BOT_TOKEN]")
         print("       sapiens wakeup --help")
         sys.exit(1)
 
