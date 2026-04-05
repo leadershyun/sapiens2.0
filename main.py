@@ -1,7 +1,8 @@
 """
 Sapiens2.0 - AI Agent
 ======================
-An AI agent prototype with computer control, long-term memory, and GitHub Copilot integration.
+An AI agent prototype with computer control, long-term memory, GitHub Copilot integration,
+and automatic MCP (Model Context Protocol) discovery, installation, and usage.
 
 Features:
   1. Conversational AI powered by GitHub Copilot
@@ -9,6 +10,8 @@ Features:
   3. Short-term memory (session) and long-term memory (persistent file)
   4. Model selection (/models), new conversation (/new), full reset (/reset)
   5. Persistent GitHub account linkage across runs
+  6. Automatic MCP discovery: the agent reads GitHub MCP descriptions, selects the best
+     server for your goal, installs it, and uses it — all without manual configuration.
 
 Installation & Usage:
   pip install -e .         # Install once — makes 'sapiens' command available globally
@@ -43,6 +46,12 @@ Key Commands:
   /run <file>           Run a Python script
   /exec <cmd>           Run a shell command
   /codegen <desc>       Generate code with Copilot
+  /mcp                  Show installed MCP servers
+  /mcp list             List curated + installed MCPs
+  /mcp auto <goal>      Auto-discover, select, and install the best MCP for a goal
+  /mcp install <name>   Install an MCP from the curated registry by name
+  /mcp tools <name>     List tools available in an installed MCP server
+  /mcp call <n> <t> [j] Call MCP tool <t> on server <n> with optional JSON args
   /help                 Show help text
   /exit or /quit        Exit
 
@@ -56,11 +65,21 @@ Computer control:
   Just ask naturally: "what files are in this folder?" or "run the tests" and the
   agent will use the appropriate tools automatically.
 
+MCP auto-discovery:
+  The agent automatically discovers, installs, and uses MCP servers when needed.
+  - It searches GitHub for MCP repos, reads their README/description, and uses
+    Copilot to pick the best match for the user's goal.
+  - A curated baseline registry of well-known MCPs is always available.
+  - All installation steps are logged transparently (repo URL, package name, command).
+  - Installed MCPs are persisted to ~/.sapiens2/mcp_state.json across sessions.
+  - The agent can call MCP tools automatically using <tool>/mcp-call ...</tool> tags.
+
 Dependencies:
   pip install requests
 """
 
 import argparse
+import base64
 import os
 import re
 import subprocess
@@ -68,7 +87,7 @@ import sys
 import time
 import json
 import textwrap
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 try:
     import requests
@@ -150,6 +169,117 @@ AUTH_CONFIG_FILE = os.path.join(AUTH_CONFIG_DIR, "config.json")
 # Regex to detect agent tool calls embedded in model responses
 # Format: <tool>/command args</tool>
 TOOL_CALL_RE = re.compile(r'<tool>(.*?)</tool>', re.DOTALL | re.IGNORECASE)
+
+# ─────────────────────────────────────────────
+#  MCP (Model Context Protocol) Constants
+# ─────────────────────────────────────────────
+
+# Persistent MCP state (installed servers, etc.) — stored next to auth config
+MCP_STATE_FILE = os.path.join(AUTH_CONFIG_DIR, "mcp_state.json")
+
+# GitHub REST API endpoints for MCP discovery
+GITHUB_SEARCH_API = "https://api.github.com/search/repositories"
+GITHUB_REPOS_API = "https://api.github.com/repos"
+
+# Maximum GitHub search results to evaluate per auto-discovery run
+MCP_MAX_CANDIDATES = 5
+
+# MCP JSON-RPC protocol version
+MCP_PROTOCOL_VERSION = "2024-11-05"
+
+# Sapiens client version reported in the MCP initialize handshake
+SAPIENS_VERSION = "2.0"
+
+# Maximum lines to read from MCP server stdout when waiting for a JSON-RPC response
+MCP_MAX_RESPONSE_LINES = 50
+
+# Regex for extracting npm package names from README install instructions
+NPM_PACKAGE_RE = re.compile(r"npm install.*?([\w@][\w/.-]+)")
+
+# Max characters to include from stderr in error messages
+MCP_STDERR_MAX_CHARS = 300
+
+# Max characters to read from a GitHub README for MCP description extraction
+GITHUB_README_MAX_CHARS = 2000
+
+# Stop words excluded from MCP keyword scoring (common English words with no discriminating value)
+_MCP_SCORE_STOP_WORDS = {"", "a", "an", "the", "to", "for", "in", "of", "and", "or", "is", "on"}
+
+# Curated baseline registry of well-known, safe MCP servers.
+# Each entry is fully self-describing so the agent can install and run without
+# any additional lookup.  Extended at runtime by GitHub discovery.
+MCP_CURATED_REGISTRY: List[Dict] = [
+    {
+        "name": "filesystem",
+        "package": "@modelcontextprotocol/server-filesystem",
+        "install_type": "npm",
+        "run_cmd": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+        "description": (
+            "File system access: read, write, list, and search files and directories "
+            "on the local machine."
+        ),
+        "tags": ["files", "filesystem", "local", "read", "write", "directory", "folder"],
+        "repo": "modelcontextprotocol/servers",
+    },
+    {
+        "name": "github",
+        "package": "@modelcontextprotocol/server-github",
+        "install_type": "npm",
+        "run_cmd": ["npx", "-y", "@modelcontextprotocol/server-github"],
+        "description": (
+            "GitHub integration: search code/repos, read files, manage issues and pull requests."
+        ),
+        "tags": ["github", "git", "repositories", "issues", "pull requests", "code search"],
+        "repo": "modelcontextprotocol/servers",
+        "env_hints": {"GITHUB_PERSONAL_ACCESS_TOKEN": "GitHub PAT for private repo access"},
+    },
+    {
+        "name": "brave-search",
+        "package": "@modelcontextprotocol/server-brave-search",
+        "install_type": "npm",
+        "run_cmd": ["npx", "-y", "@modelcontextprotocol/server-brave-search"],
+        "description": (
+            "Web search using Brave Search API — finds current information from the internet."
+        ),
+        "tags": ["web search", "internet", "search", "browse", "online", "news", "lookup"],
+        "repo": "modelcontextprotocol/servers",
+        "env_hints": {"BRAVE_API_KEY": "Brave Search API key (get at https://api.search.brave.com)"},
+    },
+    {
+        "name": "sqlite",
+        "package": "@modelcontextprotocol/server-sqlite",
+        "install_type": "npm",
+        "run_cmd": ["npx", "-y", "@modelcontextprotocol/server-sqlite"],
+        "description": (
+            "SQLite database operations: query, insert, update, and manage SQLite databases."
+        ),
+        "tags": ["database", "sqlite", "sql", "query", "data", "db"],
+        "repo": "modelcontextprotocol/servers",
+    },
+    {
+        "name": "puppeteer",
+        "package": "@modelcontextprotocol/server-puppeteer",
+        "install_type": "npm",
+        "run_cmd": ["npx", "-y", "@modelcontextprotocol/server-puppeteer"],
+        "description": (
+            "Browser automation: navigate web pages, click buttons, fill forms, take screenshots."
+        ),
+        "tags": [
+            "browser", "automation", "web", "scraping", "screenshot",
+            "puppeteer", "navigate", "click",
+        ],
+        "repo": "modelcontextprotocol/servers",
+    },
+    {
+        "name": "fetch",
+        "package": "@modelcontextprotocol/server-fetch",
+        "install_type": "npm",
+        "run_cmd": ["npx", "-y", "@modelcontextprotocol/server-fetch"],
+        "description": "HTTP fetch: retrieve content from URLs and web APIs.",
+        "tags": ["http", "fetch", "web", "api", "download", "url", "request"],
+        "repo": "modelcontextprotocol/servers",
+    },
+]
 
 
 # ─────────────────────────────────────────────
@@ -873,7 +1003,599 @@ class SystemCommandModule:
 
 
 # ─────────────────────────────────────────────
-#  Module 3: Agent Core
+#  Module 3: MCP Runner (JSON-RPC stdio client)
+# ─────────────────────────────────────────────
+
+class MCPRunner:
+    """
+    Manages a single MCP server subprocess and communicates with it via the
+    Model Context Protocol JSON-RPC 2.0 stdio transport.
+
+    Lifecycle:
+      runner = MCPRunner(["npx", "-y", "@modelcontextprotocol/server-filesystem", "."])
+      ok, msg = runner.start()     # launch server + initialize
+      tools   = runner.get_tools() # list available tools
+      result  = runner.call_tool("read_file", {"path": "README.md"})
+      runner.stop()                # terminate server process
+    """
+
+    def __init__(self, run_cmd: List[str], env: Optional[Dict[str, str]] = None):
+        self._cmd = run_cmd
+        self._extra_env = env or {}
+        self._process: Optional[subprocess.Popen] = None
+        self._msg_id = 0
+        self._tools: List[Dict] = []
+
+    # ── Internal helpers ────────────────────────
+
+    def _next_id(self) -> int:
+        self._msg_id += 1
+        return self._msg_id
+
+    def _send(self, method: str, params: Optional[dict] = None) -> Optional[dict]:
+        """
+        Send a JSON-RPC 2.0 request to the MCP server and return the response.
+        Reads up to MCP_MAX_RESPONSE_LINES lines of stdout looking for the matching response ID.
+        """
+        if not self._process:
+            return None
+        msg_id = self._next_id()
+        req: dict = {"jsonrpc": "2.0", "id": msg_id, "method": method}
+        if params is not None:
+            req["params"] = params
+        try:
+            line = json.dumps(req) + "\n"
+            self._process.stdin.write(line.encode("utf-8"))
+            self._process.stdin.flush()
+            for _ in range(MCP_MAX_RESPONSE_LINES):
+                raw = self._process.stdout.readline()
+                if not raw:
+                    break
+                try:
+                    resp = json.loads(raw.decode("utf-8", errors="replace"))
+                    if resp.get("id") == msg_id:
+                        return resp
+                except json.JSONDecodeError:
+                    continue  # skip non-JSON lines (e.g. startup messages)
+        except (BrokenPipeError, OSError):
+            pass
+        return None
+
+    def _notify(self, method: str, params: Optional[dict] = None) -> None:
+        """Send a JSON-RPC notification (no id, no response expected)."""
+        if not self._process:
+            return
+        notif: dict = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            notif["params"] = params
+        try:
+            self._process.stdin.write((json.dumps(notif) + "\n").encode("utf-8"))
+            self._process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    # ── Public API ──────────────────────────────
+
+    def start(self) -> Tuple[bool, str]:
+        """
+        Launch the MCP server subprocess and complete the initialize handshake.
+
+        Returns:
+            (True, "OK") on success, (False, error_message) on failure.
+        """
+        full_env = os.environ.copy()
+        full_env.update(self._extra_env)
+        try:
+            self._process = subprocess.Popen(
+                self._cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=full_env,
+            )
+        except FileNotFoundError as exc:
+            return False, f"Command not found: {exc}"
+        except OSError as exc:
+            return False, f"Failed to start MCP server: {exc}"
+
+        # MCP initialize handshake
+        init_resp = self._send("initialize", {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "clientInfo": {"name": "sapiens2", "version": SAPIENS_VERSION},
+        })
+        if init_resp is None:
+            self.stop()
+            return False, "No response to initialize request."
+        if "error" in init_resp:
+            self.stop()
+            err = init_resp["error"]
+            return False, f"initialize error: {err.get('message', str(err))}"
+
+        # Send the required initialized notification
+        self._notify("notifications/initialized")
+
+        # Fetch tool list
+        tools_resp = self._send("tools/list")
+        if tools_resp and "result" in tools_resp:
+            self._tools = tools_resp["result"].get("tools", [])
+
+        return True, "OK"
+
+    def get_tools(self) -> List[Dict]:
+        """Return the list of tools exposed by this MCP server."""
+        return list(self._tools)
+
+    def call_tool(self, tool_name: str, arguments: dict) -> str:
+        """
+        Call a named tool on the MCP server and return the result as plain text.
+
+        Args:
+            tool_name:  Name of the tool (as reported by tools/list).
+            arguments:  Dict of tool arguments (must match the tool's input schema).
+
+        Returns:
+            Human-readable result string, or an error message prefixed with [MCP Error].
+        """
+        resp = self._send("tools/call", {"name": tool_name, "arguments": arguments})
+        if resp is None:
+            return "[MCP Error] No response from server (timeout or connection lost)."
+        if "error" in resp:
+            err = resp["error"]
+            return f"[MCP Error] {err.get('message', str(err))}"
+
+        result = resp.get("result", {})
+        content = result.get("content", [])
+        parts: List[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type", "")
+            if item_type == "text":
+                parts.append(item.get("text", ""))
+            elif item_type == "resource":
+                resource = item.get("resource", {})
+                text = resource.get("text") or resource.get("uri", "")
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts) if parts else "(no output)"
+
+    def stop(self) -> None:
+        """Terminate the MCP server process."""
+        if self._process:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    self._process.kill()
+                except OSError:
+                    pass
+            self._process = None
+
+
+# ─────────────────────────────────────────────
+#  Module 4: MCP Discovery / Selection / Install
+# ─────────────────────────────────────────────
+
+class MCPModule:
+    """
+    MCP (Model Context Protocol) auto-discovery, selection, installation, and usage.
+
+    Discovery:
+      Searches GitHub for MCP server repos matching the user's goal, reads their
+      README/description, and combines them with a curated baseline registry.
+
+    Selection:
+      Uses Copilot to pick the best MCP candidate based on the user's stated goal.
+      Falls back to keyword matching when Copilot is not authenticated.
+
+    Installation:
+      Supports npm (via npx) and pip-based MCP servers.
+      All installation steps are logged so the user can see exactly what is happening.
+
+    Usage:
+      Starts the MCP server as a subprocess and calls its tools via the JSON-RPC
+      stdio protocol (MCPRunner).  Results are fed back into the agent loop.
+
+    Persistence:
+      Installed MCPs are saved to ~/.sapiens2/mcp_state.json and loaded on startup.
+    """
+
+    def __init__(self, copilot: "CopilotModule"):
+        self._copilot = copilot
+        self._installed: Dict[str, dict] = {}
+        self._load_state()
+
+    # ── State persistence ────────────────────────
+
+    def _load_state(self) -> None:
+        """Load persisted MCP installation state from disk."""
+        if not os.path.exists(MCP_STATE_FILE):
+            return
+        try:
+            with open(MCP_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._installed = data.get("installed", {})
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    def _save_state(self) -> None:
+        """Persist MCP installation state to disk."""
+        try:
+            os.makedirs(os.path.dirname(MCP_STATE_FILE), exist_ok=True)
+            with open(MCP_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"installed": self._installed}, f, ensure_ascii=False, indent=2)
+        except IOError:
+            pass
+
+    # ── Installed MCP queries ────────────────────
+
+    def list_installed(self) -> Dict[str, dict]:
+        """Return all installed MCPs as {name: info}."""
+        return dict(self._installed)
+
+    def is_installed(self, name: str) -> bool:
+        return name in self._installed
+
+    def get_installed(self, name: str) -> Optional[dict]:
+        return self._installed.get(name)
+
+    # ── GitHub discovery ─────────────────────────
+
+    def _gh_headers(self) -> Dict[str, str]:
+        """Return GitHub API request headers, including auth if available."""
+        headers: Dict[str, str] = {"Accept": "application/vnd.github+json"}
+        token = self._copilot._github_token
+        if token:
+            headers["Authorization"] = f"token {token}"
+        return headers
+
+    def search_github(self, query: str) -> List[dict]:
+        """
+        Search GitHub for MCP-related repositories matching *query*.
+        Results are sorted by stars and limited to MCP_MAX_CANDIDATES entries.
+
+        Returns a list of partial MCP info dicts (no run_cmd yet — set by install).
+        """
+        try:
+            resp = requests.get(
+                GITHUB_SEARCH_API,
+                params={
+                    "q": f"{query} topic:mcp",
+                    "sort": "stars",
+                    "per_page": MCP_MAX_CANDIDATES,
+                },
+                headers=self._gh_headers(),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+        except requests.RequestException:
+            return []
+
+        results = []
+        for item in items:
+            results.append({
+                "name": item.get("name", ""),
+                "full_name": item.get("full_name", ""),
+                "description": item.get("description") or "",
+                "stars": item.get("stargazers_count", 0),
+                "url": item.get("html_url", ""),
+                "default_branch": item.get("default_branch", "main"),
+                "install_type": "npm",
+                "run_cmd": [],
+                "tags": [],
+                "package": "",
+            })
+        return results
+
+    def fetch_readme(self, full_name: str) -> str:
+        """
+        Fetch the README of a GitHub repository (up to GITHUB_README_MAX_CHARS characters).
+        Returns an empty string if the README cannot be retrieved.
+        """
+        try:
+            resp = requests.get(
+                f"{GITHUB_REPOS_API}/{full_name}/readme",
+                headers=self._gh_headers(),
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                raw_content = resp.json().get("content", "")
+                decoded = base64.b64decode(raw_content).decode("utf-8", errors="replace")
+                return decoded[:GITHUB_README_MAX_CHARS]
+        except requests.RequestException:
+            pass
+        return ""
+
+    # ── Copilot-based selection ──────────────────
+
+    def select_best(self, goal: str, candidates: List[dict]) -> Optional[dict]:
+        """
+        Use Copilot to pick the best MCP for *goal* from *candidates*.
+        Falls back to the first entry when Copilot is unavailable.
+
+        Returns the selected candidate dict, or None if candidates is empty.
+        """
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        candidates_text = "\n\n".join(
+            f"[{i + 1}] {c.get('name', '?')} "
+            f"({c.get('full_name') or c.get('package', '')})\n"
+            f"   Description: {c.get('description', '(none)')}\n"
+            f"   Tags: {', '.join(c.get('tags', []))}\n"
+            f"   Stars: {c.get('stars', 'N/A')}"
+            for i, c in enumerate(candidates)
+        )
+        prompt = (
+            f"User goal: {goal}\n\n"
+            f"Available MCP servers:\n{candidates_text}\n\n"
+            "Which MCP server number is BEST for this goal? "
+            "Reply with ONLY the number (e.g. '2'). No explanation."
+        )
+
+        if self._copilot.is_authenticated():
+            result = self._copilot._call_copilot_api(
+                "You are a technical assistant selecting the best MCP server for a user's goal. "
+                "Be concise. Reply with only a single integer.",
+                prompt,
+                max_tokens=8,
+            )
+            if result:
+                match = re.search(r"\d+", result.strip())
+                if match:
+                    idx = int(match.group()) - 1
+                    if 0 <= idx < len(candidates):
+                        return candidates[idx]
+
+        # Fallback: word-based scoring — pick candidate with the most tag words in the goal
+        goal_words = set(re.split(r"\W+", goal.lower())) - _MCP_SCORE_STOP_WORDS
+        best: Optional[dict] = None
+        best_score = 0
+        for c in candidates:
+            tags = c.get("tags", [])
+            score = sum(
+                1
+                for tag in tags
+                for tw in re.split(r"\W+", tag.lower())
+                if tw and tw in goal_words
+            )
+            if score > best_score:
+                best_score = score
+                best = c
+
+        return best if best else candidates[0]
+
+    # ── Full auto-discovery pipeline ─────────────
+
+    def discover_and_select(self, goal: str) -> Optional[dict]:
+        """
+        Full discovery pipeline:
+          1. Start with the curated baseline registry.
+          2. Search GitHub for additional MCP candidates matching *goal*.
+          3. Fetch READMEs for GitHub results to enrich descriptions.
+          4. Use Copilot (or keyword matching) to select the best candidate.
+
+        Returns the selected MCP info dict, or None if no candidates were found.
+        """
+        print(f"\n[MCP] Discovering MCP servers for: {goal[:80]}...")
+
+        # Curated baseline
+        candidates: List[dict] = list(MCP_CURATED_REGISTRY)
+
+        # GitHub search
+        github_hits = self.search_github(goal)
+        if github_hits:
+            print(f"[MCP] GitHub search returned {len(github_hits)} result(s).")
+            for hit in github_hits[:3]:
+                readme = self.fetch_readme(hit.get("full_name", ""))
+                if readme:
+                    # Enrich description from README if API description is empty
+                    if not hit.get("description"):
+                        for readme_line in readme.splitlines():
+                            clean = readme_line.strip("# ").strip()
+                            if clean and not clean.startswith(("!", "[", "<")):
+                                hit["description"] = clean[:200]
+                                break
+                    # Extract npm package name from README if present
+                    npm_match = NPM_PACKAGE_RE.search(readme)
+                    if npm_match:
+                        hit["package"] = npm_match.group(1)
+                candidates.append(hit)
+
+        if not candidates:
+            print("[MCP] No candidates found.")
+            return None
+
+        selected = self.select_best(goal, candidates)
+        if selected:
+            print(
+                f"[MCP] Selected: {selected.get('name', '?')} — "
+                f"{selected.get('description', '')[:80]}"
+            )
+        return selected
+
+    # ── Installation ─────────────────────────────
+
+    def install(self, mcp_info: dict) -> Tuple[bool, str]:
+        """
+        Install an MCP server.
+
+        Supports install_type values:
+          "npm"  — checks npm is available, then runs npm install -g <package>
+                   (npx is used at runtime so a failed pre-install is non-fatal)
+          "pip"  — runs pip install <package>
+
+        All installation steps are printed so the user can see what is happening.
+
+        Returns:
+            (True, success_message) or (False, error_message)
+        """
+        name = mcp_info.get("name", "unknown")
+        install_type = mcp_info.get("install_type", "npm")
+        package = mcp_info.get("package", "")
+        repo = mcp_info.get("repo") or mcp_info.get("full_name", "")
+
+        print(f"\n[MCP] ─── Installing '{name}' ───────────────────────────")
+        if repo:
+            print(f"[MCP]   Repository : https://github.com/{repo}")
+        print(f"[MCP]   Package    : {package or '(none)'}")
+        print(f"[MCP]   Install via: {install_type}")
+        print(f"[MCP]   Description: {mcp_info.get('description', '')[:80]}")
+
+        env_hints = mcp_info.get("env_hints", {})
+        if env_hints:
+            print("[MCP]   Env vars needed:")
+            for var, hint in env_hints.items():
+                val = os.environ.get(var, "")
+                status = "✓ set" if val else "✗ NOT SET"
+                print(f"[MCP]     {var} [{status}] — {hint}")
+        print()
+
+        if install_type == "npm":
+            # Verify npm is available
+            try:
+                npm_check = subprocess.run(
+                    ["npm", "--version"], capture_output=True, text=True, timeout=10
+                )
+                if npm_check.returncode != 0:
+                    return False, (
+                        "npm returned a non-zero exit code. "
+                        "Please install Node.js from https://nodejs.org"
+                    )
+            except FileNotFoundError:
+                return False, (
+                    "npm not found. Install Node.js from https://nodejs.org "
+                    "then retry."
+                )
+            except subprocess.TimeoutExpired:
+                return False, "npm availability check timed out."
+
+            # Pre-install the package globally (speeds up first use; non-fatal on failure)
+            if package:
+                print(f"[MCP] Running: npm install -g {package}")
+                try:
+                    result = subprocess.run(
+                        ["npm", "install", "-g", package],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    if result.returncode != 0:
+                        print(
+                            f"[MCP] Warning: npm install failed (npx will handle it on first use):\n"
+                            f"  {result.stderr.strip()[:MCP_STDERR_MAX_CHARS]}"
+                        )
+                    else:
+                        print(f"[MCP] npm install succeeded.")
+                except subprocess.TimeoutExpired:
+                    print("[MCP] Warning: npm install timed out (npx will install on first use).")
+                except FileNotFoundError:
+                    pass  # Already checked above
+
+        elif install_type == "pip":
+            if not package:
+                return False, "No pip package name specified in MCP info."
+            print(f"[MCP] Running: pip install {package}")
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", package, "-q"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode != 0:
+                    return False, f"pip install failed:\n{result.stderr.strip()[:MCP_STDERR_MAX_CHARS]}"
+                print("[MCP] pip install succeeded.")
+            except subprocess.TimeoutExpired:
+                return False, "pip install timed out."
+
+        else:
+            return False, f"Unsupported install_type: '{install_type}'"
+
+        # Register as installed
+        entry = {
+            **mcp_info,
+            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        self._installed[name] = entry
+        self._save_state()
+        return True, f"✅ MCP '{name}' installed and registered."
+
+    # ── Tool enumeration ─────────────────────────
+
+    def get_available_tools(self, mcp_name: str) -> List[dict]:
+        """
+        Start the named MCP server, fetch its tool list, and shut it down.
+        Returns an empty list if the server cannot be started.
+        """
+        info = self._installed.get(mcp_name)
+        if not info:
+            return []
+        run_cmd = info.get("run_cmd", [])
+        if not run_cmd:
+            return []
+
+        runner = MCPRunner(run_cmd)
+        ok, _ = runner.start()
+        if not ok:
+            return []
+        try:
+            return runner.get_tools()
+        finally:
+            runner.stop()
+
+    # ── Tool execution ───────────────────────────
+
+    def call_tool(self, mcp_name: str, tool_name: str, arguments: dict) -> str:
+        """
+        Start the named MCP server, call *tool_name* with *arguments*, return the result.
+
+        The server is started fresh for each call and shut down immediately after.
+        This keeps the implementation simple at the cost of some startup overhead.
+
+        Returns:
+            Tool result as a string, or an error message.
+        """
+        info = self._installed.get(mcp_name)
+        if not info:
+            return (
+                f"[MCP Error] '{mcp_name}' is not installed. "
+                f"Run: /mcp install {mcp_name}"
+            )
+        run_cmd = info.get("run_cmd", [])
+        if not run_cmd:
+            return f"[MCP Error] No run command configured for '{mcp_name}'."
+
+        # Build environment — pass any required env vars from the current process
+        env: Dict[str, str] = {}
+        for var in info.get("env_hints", {}):
+            val = os.environ.get(var, "")
+            if val:
+                env[var] = val
+        # Always forward GITHUB_TOKEN for GitHub-related MCPs
+        if os.environ.get("GITHUB_TOKEN"):
+            env.setdefault("GITHUB_TOKEN", os.environ["GITHUB_TOKEN"])
+        if self._copilot._github_token:
+            env.setdefault("GITHUB_PERSONAL_ACCESS_TOKEN", self._copilot._github_token)
+
+        runner = MCPRunner(run_cmd, env=env)
+        ok, err_msg = runner.start()
+        if not ok:
+            return f"[MCP Error] Could not start '{mcp_name}': {err_msg}"
+        try:
+            return runner.call_tool(tool_name, arguments)
+        finally:
+            runner.stop()
+
+
+# ─────────────────────────────────────────────
+#  Module 5: Agent Core
 # ─────────────────────────────────────────────
 
 class AgentCore:
@@ -906,6 +1628,9 @@ class AgentCore:
             saved_token = _load_auth_token()
             if saved_token:
                 self.copilot.set_token(saved_token)
+
+        # MCP module — depends on copilot (for GitHub token + AI selection)
+        self.mcp = MCPModule(self.copilot)
 
     # ── State management ────────────────────────
 
@@ -1030,12 +1755,35 @@ class AgentCore:
             if not arg1:
                 return "[Error] Usage: /run <file.py>"
             return self.system.run_file(arg1)
+        elif cmd == "/mcp-auto":
+            # Auto-discover and install best MCP for a goal
+            goal = cmd_str[len("/mcp-auto"):].strip()
+            if not goal:
+                return "[Error] Usage: /mcp-auto <goal description>"
+            return self._do_mcp_auto(goal)
+        elif cmd == "/mcp-call":
+            # Call a tool on an installed MCP: /mcp-call <mcp_name> <tool_name> [json_args]
+            rest = cmd_str[len("/mcp-call"):].strip()
+            call_parts = rest.split(None, 2)
+            if len(call_parts) < 2:
+                return "[Error] Usage: /mcp-call <mcp_name> <tool_name> [json_args]"
+            mcp_name = call_parts[0]
+            tool_name = call_parts[1]
+            json_args_str = call_parts[2] if len(call_parts) > 2 else "{}"
+            try:
+                arguments = json.loads(json_args_str)
+            except json.JSONDecodeError:
+                return (
+                    f"[MCP Error] Invalid JSON arguments for /mcp-call: {json_args_str!r}\n"
+                    "  Provide valid JSON, e.g.: {\"path\": \"README.md\"}"
+                )
+            return self.mcp.call_tool(mcp_name, tool_name, arguments)
         else:
             return f"[Error] Unknown tool: {cmd}"
 
     def _run_agent_chat(self, user_msg: str, history: list, lt_context: str) -> str:
         """
-        Agentic chat loop: the model can issue computer control tool calls in its
+        Agentic chat loop: the model can issue computer control and MCP tool calls in its
         response using <tool>/command args</tool> tags. Tool results are fed back
         to the model, and the loop continues until the model gives a final answer
         with no more tool calls (up to 5 iterations).
@@ -1051,7 +1799,8 @@ class AgentCore:
         Returns:
             Final model response (natural language answer to the user).
         """
-        system_prompt = _build_agent_system_prompt(lt_context)
+        installed_mcps = self.mcp.list_installed()
+        system_prompt = _build_agent_system_prompt(lt_context, installed_mcps)
         messages: List[Dict[str, str]] = list(history) + [{"role": "user", "content": user_msg}]
 
         last_response = ""
@@ -1278,6 +2027,10 @@ class AgentCore:
         if cmd in ("/help", "/?"):
             return _help_text()
 
+        # ── MCP commands ─────────────────────────
+        if cmd == "/mcp":
+            return self._handle_mcp_command(arg1, arg2, raw)
+
         # ── Update ───────────────────────────────
         if cmd == "/update":
             return self._do_update()
@@ -1288,6 +2041,176 @@ class AgentCore:
             sys.exit(0)
 
         return f"[Error] Unknown command: {cmd}\nType /help to see all available commands."
+
+    def _handle_mcp_command(self, sub: str, rest: str, raw: str) -> str:
+        """
+        Handle all /mcp sub-commands.
+
+        Sub-commands:
+          /mcp                      — show installed MCPs
+          /mcp list                 — list curated + installed MCPs
+          /mcp auto <goal>          — auto-discover, select, and install best MCP for goal
+          /mcp install <name>       — install a curated MCP by name
+          /mcp tools <name>         — list tools exposed by an installed MCP
+          /mcp call <n> <t> [args]  — call tool <t> on MCP <n> with optional JSON args
+        """
+        sub_lower = sub.lower() if sub else ""
+
+        # /mcp  or  /mcp list — show installed + curated
+        if sub_lower in ("", "list"):
+            installed = self.mcp.list_installed()
+            lines: List[str] = []
+
+            if installed:
+                lines.append("Installed MCP servers:")
+                for name, info in installed.items():
+                    lines.append(
+                        f"  ✅ {name:<20} {info.get('description', '')[:60]}"
+                    )
+            else:
+                lines.append("No MCP servers installed yet.")
+
+            lines.append("")
+            lines.append("Curated MCP registry (ready to install):")
+            for entry in MCP_CURATED_REGISTRY:
+                marker = "  ✅" if entry["name"] in installed else "    "
+                lines.append(
+                    f"{marker} {entry['name']:<20} {entry['description'][:60]}"
+                )
+            lines.append("")
+            lines.append("Commands:")
+            lines.append("  /mcp auto <goal>       — auto-discover and install the best MCP")
+            lines.append("  /mcp install <name>    — install a curated MCP by name")
+            lines.append("  /mcp tools <name>      — list tools in an installed MCP")
+            lines.append("  /mcp call <n> <t> [j]  — call a tool directly")
+            return "\n".join(lines)
+
+        # /mcp auto <goal>
+        if sub_lower == "auto":
+            goal = rest.strip()
+            if not goal:
+                return "[Error] Usage: /mcp auto <goal description>"
+            return self._do_mcp_auto(goal)
+
+        # /mcp install <name>
+        if sub_lower == "install":
+            name = rest.strip().split()[0] if rest.strip() else ""
+            if not name:
+                return "[Error] Usage: /mcp install <name>"
+            return self._do_mcp_install_by_name(name)
+
+        # /mcp tools <name>
+        if sub_lower == "tools":
+            name = rest.strip().split()[0] if rest.strip() else ""
+            if not name:
+                return "[Error] Usage: /mcp tools <mcp_name>"
+            if not self.mcp.is_installed(name):
+                return f"[Error] '{name}' is not installed. Run: /mcp install {name}"
+            print(f"[MCP] Starting '{name}' to fetch tool list...")
+            tools = self.mcp.get_available_tools(name)
+            if not tools:
+                return f"[MCP] Could not retrieve tools for '{name}' (server may have failed to start)."
+            lines = [f"Tools available in '{name}':"]
+            for t in tools:
+                desc = t.get("description", "")
+                lines.append(f"  • {t.get('name', '?'):<30} {desc[:60]}")
+            return "\n".join(lines)
+
+        # /mcp call <mcp_name> <tool_name> [json_args]
+        if sub_lower == "call":
+            call_parts = rest.strip().split(None, 2)
+            if len(call_parts) < 2:
+                return "[Error] Usage: /mcp call <mcp_name> <tool_name> [json_args]"
+            mcp_name = call_parts[0]
+            tool_name = call_parts[1]
+            json_str = call_parts[2] if len(call_parts) > 2 else "{}"
+            try:
+                arguments = json.loads(json_str)
+            except json.JSONDecodeError:
+                return f"[Error] Invalid JSON arguments: {json_str}"
+            if not self.mcp.is_installed(mcp_name):
+                return f"[Error] '{mcp_name}' is not installed. Run: /mcp install {mcp_name}"
+            print(f"[MCP] Calling {mcp_name}/{tool_name}...")
+            result = self.mcp.call_tool(mcp_name, tool_name, arguments)
+            return result
+
+        return (
+            f"[Error] Unknown /mcp sub-command: '{sub}'\n"
+            "  Run /mcp for usage information."
+        )
+
+    def _do_mcp_auto(self, goal: str) -> str:
+        """
+        Auto-discover, select, and install the best MCP for *goal*.
+        Called both from /mcp auto and from the agent tool <tool>/mcp-auto goal</tool>.
+        """
+        selected = self.mcp.discover_and_select(goal)
+        if not selected:
+            return (
+                "[MCP] No suitable MCP found for this goal.\n"
+                "  You can browse MCPs at https://github.com/topics/mcp and install one "
+                "manually with: /mcp install <name>"
+            )
+
+        name = selected.get("name", "unknown")
+
+        # Already installed? Skip install step.
+        if self.mcp.is_installed(name):
+            return (
+                f"[MCP] '{name}' is already installed and ready.\n"
+                f"  Description: {selected.get('description', '')}\n"
+                f"  Run /mcp tools {name} to see available tools."
+            )
+
+        ok, msg = self.mcp.install(selected)
+        if not ok:
+            return f"[MCP] Installation failed: {msg}"
+
+        env_hints = selected.get("env_hints", {})
+        missing_vars = [v for v in env_hints if not os.environ.get(v)]
+
+        lines = [msg]
+        if missing_vars:
+            lines.append("")
+            lines.append("⚠️  The following environment variables may be required:")
+            for var in missing_vars:
+                lines.append(f"  {var} — {env_hints[var]}")
+            lines.append("  Set them before calling tools from this MCP.")
+        lines.append(f"\nRun /mcp tools {name} to see what tools are now available.")
+        return "\n".join(lines)
+
+    def _do_mcp_install_by_name(self, name: str) -> str:
+        """Install a named MCP from the curated registry."""
+        # Find in curated registry (case-insensitive)
+        registry_entry = next(
+            (e for e in MCP_CURATED_REGISTRY if e["name"].lower() == name.lower()),
+            None,
+        )
+        if not registry_entry:
+            known = ", ".join(e["name"] for e in MCP_CURATED_REGISTRY)
+            return (
+                f"[Error] '{name}' not found in the curated registry.\n"
+                f"  Known names: {known}\n"
+                f"  For GitHub discovery: /mcp auto <goal description>"
+            )
+
+        if self.mcp.is_installed(registry_entry["name"]):
+            return f"[MCP] '{registry_entry['name']}' is already installed."
+
+        ok, msg = self.mcp.install(registry_entry)
+        if not ok:
+            return f"[MCP] Installation failed: {msg}"
+
+        env_hints = registry_entry.get("env_hints", {})
+        missing_vars = [v for v in env_hints if not os.environ.get(v)]
+        lines = [msg]
+        if missing_vars:
+            lines.append("")
+            lines.append("⚠️  This MCP requires environment variables:")
+            for var in missing_vars:
+                lines.append(f"  {var} — {env_hints[var]}")
+        lines.append(f"\nRun /mcp tools {registry_entry['name']} to see available tools.")
+        return "\n".join(lines)
 
     def _do_update(self) -> str:
         """
@@ -1421,11 +2344,11 @@ def _run_subprocess(cmd: Union[str, List[str]], cwd: str = ".", shell: bool = Fa
         return f"[Error] Permission denied: {e}"
 
 
-def _build_agent_system_prompt(lt_context: str = "") -> str:
+def _build_agent_system_prompt(lt_context: str = "", installed_mcps: Optional[Dict[str, dict]] = None) -> str:
     """
     Build the system prompt for the agentic chat loop.
-    Explicitly informs the model of its computer control capabilities and the
-    tool-call format it must use to actually execute commands.
+    Explicitly informs the model of its computer control capabilities, MCP tools,
+    and the tool-call format it must use to actually execute commands.
     """
     parts = [
         "You are Sapiens2.0, an AI agent with DIRECT computer control capabilities.\n"
@@ -1434,12 +2357,12 @@ def _build_agent_system_prompt(lt_context: str = "") -> str:
         "files, navigate directories, run commands, or perform any local task, you MUST "
         "use the tools below — do not just describe what to do, ACTUALLY DO IT.\n"
         "\n"
-        "HOW TO USE COMPUTER CONTROL TOOLS:\n"
+        "HOW TO USE TOOLS:\n"
         "Include tool calls in your response using this exact format:\n"
         "  <tool>/command args</tool>\n"
         "These are executed automatically; results are fed back to you.\n"
         "\n"
-        "AVAILABLE TOOLS:\n"
+        "COMPUTER CONTROL TOOLS:\n"
         "  <tool>/pwd</tool>                   — show current working directory\n"
         "  <tool>/ls</tool>                    — list current directory contents\n"
         "  <tool>/ls path/to/dir</tool>        — list a specific directory\n"
@@ -1448,7 +2371,17 @@ def _build_agent_system_prompt(lt_context: str = "") -> str:
         "  <tool>/exec shell_command</tool>     — run any shell/PowerShell command\n"
         "  <tool>/run script.py</tool>          — execute a Python script\n"
         "\n"
-        "EXAMPLES:\n"
+        "MCP AUTO-DISCOVERY TOOL:\n"
+        "  <tool>/mcp-auto goal description</tool>\n"
+        "  — Searches GitHub for the best MCP server for the goal, installs it, and\n"
+        "    reports what tools are now available. Use this when you need external\n"
+        "    capabilities (web search, browser, database, etc.) not yet installed.\n"
+        "\n"
+        "MCP TOOL CALL (after installation):\n"
+        "  <tool>/mcp-call mcp_name tool_name {\"arg\": \"value\"}</tool>\n"
+        "  — Calls a tool on an installed MCP server. The JSON arguments must be valid.\n"
+        "\n"
+        "COMPUTER CONTROL EXAMPLES:\n"
         "  User: 'what files are in this folder?' → <tool>/ls</tool>\n"
         "  User: 'show me the README'             → <tool>/cat README.md</tool>\n"
         "  User: 'what Python version?'           → <tool>/exec python --version</tool>\n"
@@ -1462,8 +2395,24 @@ def _build_agent_system_prompt(lt_context: str = "") -> str:
         "   they cannot be executed automatically from within the agent loop.\n"
         "4. Always show what you are doing before doing it.\n"
         "5. After seeing tool results, give a concise natural language summary.\n"
-        "6. Answer in the same language the user writes in.",
+        "6. Answer in the same language the user writes in.\n"
+        "7. If the user needs external capabilities (web search, database access, browser\n"
+        "   automation, etc.) and no MCP is installed, use /mcp-auto to install one.",
     ]
+
+    # Include installed MCP info if any servers are available
+    if installed_mcps:
+        mcp_lines = ["\nINSTALLED MCP SERVERS (external tool capabilities):"]
+        for mcp_name, info in installed_mcps.items():
+            desc = info.get("description", "")
+            mcp_lines.append(f"  • {mcp_name}: {desc[:80]}")
+        mcp_lines.append(
+            "\nTo call an MCP tool: <tool>/mcp-call mcp_name tool_name {\"arg\": \"value\"}</tool>"
+        )
+        mcp_lines.append(
+            "To discover tools in an MCP, first run: /mcp tools <mcp_name>"
+        )
+        parts.append("\n".join(mcp_lines))
 
     if lt_context:
         parts.append(f"\n{lt_context}")
@@ -1522,6 +2471,35 @@ def _help_text() -> str:
         CODE GENERATION:
           /codegen <description> [--lang <language>]
                                Generate code using Copilot (default language: python)
+
+        MCP — MODEL CONTEXT PROTOCOL (auto-discovery & external tools):
+          /mcp                 Show installed MCP servers
+          /mcp list            List curated + installed MCPs
+          /mcp auto <goal>     Discover, select, and install the best MCP for your goal
+                               Example: /mcp auto "I need to search the web"
+                               Example: /mcp auto "I need to browse a website"
+                               Example: /mcp auto "I need to query a SQLite database"
+          /mcp install <name>  Install a curated MCP by name (e.g. /mcp install sqlite)
+          /mcp tools <name>    List tools available in an installed MCP
+          /mcp call <n> <t> [j]
+                               Call tool <t> on MCP <n> with optional JSON args
+                               Example: /mcp call sqlite query {"sql": "SELECT * FROM t"}
+
+          The agent also uses MCPs automatically — just describe what you need:
+            "search the web for the latest Python release"
+            "open https://example.com and take a screenshot"
+            "query my users.db for all active users"
+          The agent will install the right MCP if needed and then call its tools.
+
+          Curated MCPs (always available):
+            filesystem    — read/write/list local files and directories
+            github        — search GitHub repos, issues, code (needs GITHUB_PERSONAL_ACCESS_TOKEN)
+            brave-search  — web search (needs BRAVE_API_KEY)
+            sqlite        — SQLite database operations
+            puppeteer     — browser automation and screenshots
+            fetch         — HTTP fetch from URLs and APIs
+
+          MCP state is persisted to: ~/.sapiens2/mcp_state.json
 
         OTHER:
           /update              Update Sapiens2.0 to the latest code (git pull + pip install)
@@ -1594,6 +2572,13 @@ def _print_banner(agent: "AgentCore") -> None:
     lt_mem = agent.memory.get_long_term()
     if lt_mem:
         print(f"  [M]  Long-term memory: {len(lt_mem)} entries loaded  (/memory to view)")
+
+    installed_mcps = agent.mcp.list_installed()
+    if installed_mcps:
+        names = ", ".join(installed_mcps.keys())
+        print(f"  [MCP] {len(installed_mcps)} MCP server(s) ready: {names}  (/mcp to manage)")
+    else:
+        print("  [MCP] No MCPs installed. Type /mcp auto <goal> to discover and install one.")
 
     print(f"  [>]  Model: {agent.copilot.get_model()}  (/models to change)")
     print()
