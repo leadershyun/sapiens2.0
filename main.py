@@ -52,6 +52,7 @@ Key Commands:
   /auth <token>         Provide a GitHub PAT/OAuth token directly
   /logout               Unlink the saved GitHub account
   /models [num|name]    List or select available Copilot models
+  /think [level]        View or set reasoning intensity: off / low / medium / high
   /new                  Start a new conversation (short-term memory cleared)
   /reset                Full reset: long-term memory + model settings cleared
   /update               Update Sapiens2.0 to the latest code automatically
@@ -104,6 +105,7 @@ import base64
 import itertools
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -201,6 +203,32 @@ STATE_FILE = os.path.join(AUTH_CONFIG_DIR, "sapiens_state.json")
 # Regex to detect agent tool calls embedded in model responses
 # Format: <tool>/command args</tool>
 TOOL_CALL_RE = re.compile(r'<tool>(.*?)</tool>', re.DOTALL | re.IGNORECASE)
+
+# ── /think setting ───────────────────────────────────────────────────────────
+# Valid reasoning-intensity levels and their corresponding max_tokens budgets.
+# "off"    — fastest replies, minimal token budget.
+# "low"    — concise answers.
+# "medium" — balanced (default).
+# "high"   — thorough, deep analysis; largest token budget.
+THINK_LEVELS: List[str] = ["off", "low", "medium", "high"]
+THINK_DEFAULT_LEVEL: str = "medium"
+THINK_MAX_TOKENS: Dict[str, int] = {
+    "off":    512,
+    "low":    1024,
+    "medium": 2048,
+    "high":   4096,
+}
+# System-prompt suffix added to the agent prompt for each think level.
+THINK_PROMPT_SUFFIX: Dict[str, str] = {
+    "off":    "Be brief and direct. Skip unnecessary reasoning steps.",
+    "low":    "Keep answers concise. Reason only as much as needed.",
+    "medium": "",  # Default behaviour — no extra instruction
+    "high": (
+        "Think carefully and thoroughly before answering. "
+        "Break down complex problems step-by-step, consider edge cases, "
+        "and provide a well-reasoned, detailed response."
+    ),
+}
 
 # ─────────────────────────────────────────────
 #  MCP (Model Context Protocol) Constants
@@ -312,6 +340,65 @@ MCP_CURATED_REGISTRY: List[Dict] = [
         "repo": "modelcontextprotocol/servers",
     },
 ]
+
+
+# ─────────────────────────────────────────────
+#  Node.js detection helper
+# ─────────────────────────────────────────────
+
+def _find_node_cmd(name: str) -> str:
+    """
+    Return the full path to a Node.js ecosystem command (node, npm, npx).
+
+    Handles the common Windows installation quirk where npm and npx are
+    installed as ``npm.cmd`` / ``npx.cmd`` wrapper scripts rather than
+    plain executables, which means a bare ``subprocess.run(["npm", ...])``
+    may raise FileNotFoundError even when Node.js is properly installed.
+
+    Resolution order:
+      1. ``shutil.which(name)``           — plain name via PATH
+      2. ``shutil.which(name + ".cmd")``  — Windows .cmd wrapper via PATH
+      3. Common Windows installation directories
+         (``%ProgramFiles%\\nodejs``, ``%APPDATA%\\npm``, etc.)
+
+    Falls back to returning *name* unchanged so the caller gets the original
+    FileNotFoundError if Node.js genuinely is not installed.
+    """
+    # 1. Try the plain name first (works on Linux/macOS and on Windows when
+    #    the Node.js bin directory is in PATH with the right extension).
+    found = shutil.which(name)
+    if found:
+        return found
+
+    if sys.platform == "win32":
+        # 2. Try the .cmd wrapper that npm/npx ship as on Windows.
+        found = shutil.which(name + ".cmd")
+        if found:
+            return found
+
+        # 3. Probe common Windows installation directories.
+        node_dirs = [
+            os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"), "nodejs"
+            ),
+            os.path.join(
+                os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                "nodejs",
+            ),
+            os.path.join(os.environ.get("APPDATA", ""), "npm"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "nodejs"),
+        ]
+        for node_dir in node_dirs:
+            if not node_dir or not os.path.isdir(node_dir):
+                continue
+            for suffix in (".cmd", ".exe", ""):
+                candidate = os.path.join(node_dir, name + suffix)
+                if os.path.isfile(candidate):
+                    return candidate
+
+    # Fall back to the plain name — subprocess will raise FileNotFoundError if
+    # Node.js really is not installed, and callers handle that explicitly.
+    return name
 
 
 # ─────────────────────────────────────────────
@@ -1188,16 +1275,29 @@ class MCPRunner:
         """
         full_env = os.environ.copy()
         full_env.update(self._extra_env)
+
+        # Resolve the executable so Windows .cmd wrappers (npm.cmd, npx.cmd) and
+        # non-PATH Node.js installations are found correctly.
+        cmd = list(self._cmd)
+        if cmd:
+            cmd[0] = _find_node_cmd(cmd[0])
+
         try:
             self._process = subprocess.Popen(
-                self._cmd,
+                cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=full_env,
             )
         except FileNotFoundError as exc:
-            return False, f"Command not found: {exc}"
+            executable = cmd[0] if cmd else "(unknown)"
+            return False, (
+                f"Command not found: {exc}\n"
+                f"  Could not start '{executable}'.\n"
+                "  If this is an npm/npx command, make sure Node.js is installed: https://nodejs.org\n"
+                "  After installing Node.js, restart your terminal and try again."
+            )
         except OSError as exc:
             return False, f"Failed to start MCP server: {exc}"
 
@@ -1561,10 +1661,13 @@ class MCPModule:
         print()
 
         if install_type == "npm":
+            # Resolve npm executable (handles Windows .cmd wrappers and non-PATH installs)
+            npm_cmd = _find_node_cmd("npm")
+
             # Verify npm is available
             try:
                 npm_check = subprocess.run(
-                    ["npm", "--version"], capture_output=True, text=True, timeout=10
+                    [npm_cmd, "--version"], capture_output=True, text=True, timeout=10
                 )
                 if npm_check.returncode != 0:
                     return False, (
@@ -1573,18 +1676,20 @@ class MCPModule:
                     )
             except FileNotFoundError:
                 return False, (
-                    "npm not found. Install Node.js from https://nodejs.org "
-                    "then retry."
+                    "npm (Node.js) not found. Node.js must be installed to use npm-based MCPs.\n"
+                    "  Install from: https://nodejs.org\n"
+                    "  After installing, restart your terminal and try again.\n"
+                    f"  (Tried: {npm_cmd!r})"
                 )
             except subprocess.TimeoutExpired:
                 return False, "npm availability check timed out."
 
             # Pre-install the package globally (speeds up first use; non-fatal on failure)
             if package:
-                print(f"[MCP] Running: npm install -g {package}")
+                print(f"[MCP] Running: {npm_cmd} install -g {package}")
                 try:
                     result = subprocess.run(
-                        ["npm", "install", "-g", package],
+                        [npm_cmd, "install", "-g", package],
                         capture_output=True,
                         text=True,
                         timeout=120,
@@ -1724,7 +1829,10 @@ class AgentCore:
         # Tracks the active Spinner so Ctrl+C in the main loop can stop it cleanly
         self._active_spinner: Optional[Spinner] = None
 
-        # Load saved state (model selection, etc.)
+        # Reasoning-intensity level (off/low/medium/high). Loaded from state file.
+        self._think_level: str = THINK_DEFAULT_LEVEL
+
+        # Load saved state (model selection, think level, etc.)
         self._load_state()
 
         # Token priority: explicit arg > env var > saved auth file
@@ -1741,7 +1849,7 @@ class AgentCore:
     # ── State management ────────────────────────
 
     def _load_state(self) -> None:
-        """Load agent state (model selection, etc.) from disk."""
+        """Load agent state (model selection, think level, etc.) from disk."""
         if os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -1749,6 +1857,9 @@ class AgentCore:
                 if isinstance(state, dict):
                     model = state.get("model", COPILOT_DEFAULT_MODEL)
                     self.copilot.set_model(model)
+                    think = state.get("think_level", THINK_DEFAULT_LEVEL)
+                    if think in THINK_LEVELS:
+                        self._think_level = think
             except (json.JSONDecodeError, IOError):
                 pass
 
@@ -1756,7 +1867,10 @@ class AgentCore:
         """Persist current agent state to disk."""
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-            state = {"model": self.copilot.get_model()}
+            state = {
+                "model": self.copilot.get_model(),
+                "think_level": self._think_level,
+            }
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
         except IOError as e:
@@ -1907,10 +2021,11 @@ class AgentCore:
             Final model response (natural language answer to the user).
         """
         installed_mcps = self.mcp.list_installed()
-        system_prompt = _build_agent_system_prompt(lt_context, installed_mcps)
+        system_prompt = _build_agent_system_prompt(lt_context, installed_mcps, self._think_level)
         messages: List[Dict[str, str]] = list(history) + [{"role": "user", "content": user_msg}]
 
         last_response = ""
+        max_tokens = THINK_MAX_TOKENS.get(self._think_level, THINK_MAX_TOKENS[THINK_DEFAULT_LEVEL])
 
         for _turn in range(5):  # max 5 tool-call iterations per turn
             # Show spinner while waiting for the Copilot API response
@@ -1918,7 +2033,7 @@ class AgentCore:
             self._active_spinner = spinner
             with spinner:
                 response = self.copilot._call_copilot_api_messages(
-                    system_prompt, messages, max_tokens=2048
+                    system_prompt, messages, max_tokens=max_tokens
                 )
             self._active_spinner = None
             if not response:
@@ -2139,6 +2254,10 @@ class AgentCore:
         if cmd in ("/help", "/?"):
             return _help_text()
 
+        # ── Think level ──────────────────────────
+        if cmd == "/think":
+            return self._handle_think_command(arg1)
+
         # ── MCP commands ─────────────────────────
         if cmd == "/mcp":
             return self._handle_mcp_command(arg1, arg2, raw)
@@ -2153,6 +2272,52 @@ class AgentCore:
             sys.exit(0)
 
         return f"[Error] Unknown command: {cmd}\nType /help to see all available commands."
+
+    def _handle_think_command(self, level_arg: str) -> str:
+        """
+        Handle the /think command.
+
+        /think           — show current level and available options
+        /think <level>   — set reasoning intensity (off / low / medium / high)
+        """
+        if not level_arg:
+            lines = [
+                f"Current think level: {self._think_level}  "
+                f"(max tokens: {THINK_MAX_TOKENS[self._think_level]})",
+                "",
+                "Available levels:",
+            ]
+            descriptions = {
+                "off":    "Fastest replies, minimal reasoning. Best for simple/quick questions.",
+                "low":    "Concise answers with brief reasoning.",
+                "medium": "Balanced reasoning and response length. (default)",
+                "high":   "Thorough, step-by-step analysis. Best for complex problems.",
+            }
+            for lvl in THINK_LEVELS:
+                marker = "  ◀ current" if lvl == self._think_level else ""
+                lines.append(
+                    f"  {lvl:<8} (max_tokens={THINK_MAX_TOKENS[lvl]:<5}) "
+                    f"— {descriptions[lvl]}{marker}"
+                )
+            lines.append("")
+            lines.append("To change: /think <level>   e.g. /think high")
+            return "\n".join(lines)
+
+        lvl = level_arg.strip().lower()
+        if lvl not in THINK_LEVELS:
+            valid = " / ".join(THINK_LEVELS)
+            return (
+                f"[Error] Unknown think level: '{level_arg}'\n"
+                f"  Valid levels: {valid}\n"
+                f"  Example: /think medium"
+            )
+        self._think_level = lvl
+        self._save_state()
+        return (
+            f"✅ Think level set to '{lvl}' "
+            f"(max_tokens={THINK_MAX_TOKENS[lvl]}). "
+            f"Setting saved."
+        )
 
     def _handle_mcp_command(self, sub: str, rest: str, raw: str) -> str:
         """
@@ -2456,11 +2621,20 @@ def _run_subprocess(cmd: Union[str, List[str]], cwd: str = ".", shell: bool = Fa
         return f"[Error] Permission denied: {e}"
 
 
-def _build_agent_system_prompt(lt_context: str = "", installed_mcps: Optional[Dict[str, dict]] = None) -> str:
+def _build_agent_system_prompt(
+    lt_context: str = "",
+    installed_mcps: Optional[Dict[str, dict]] = None,
+    think_level: str = THINK_DEFAULT_LEVEL,
+) -> str:
     """
     Build the system prompt for the agentic chat loop.
     Explicitly informs the model of its computer control capabilities, MCP tools,
     and the tool-call format it must use to actually execute commands.
+
+    Args:
+        lt_context:     Long-term memory context string.
+        installed_mcps: Dict of installed MCP servers.
+        think_level:    Current reasoning-intensity level (off/low/medium/high).
     """
     parts = [
         "You are Sapiens2.0, an AI agent with DIRECT computer control capabilities.\n"
@@ -2512,6 +2686,11 @@ def _build_agent_system_prompt(lt_context: str = "", installed_mcps: Optional[Di
         "   automation, etc.) and no MCP is installed, use /mcp-auto to install one.",
     ]
 
+    # Append think-level instruction when it carries a non-empty suffix
+    think_suffix = THINK_PROMPT_SUFFIX.get(think_level, "")
+    if think_suffix:
+        parts.append(f"\nTHINKING STYLE: {think_suffix}")
+
     # Include installed MCP info if any servers are available
     if installed_mcps:
         mcp_lines = ["\nINSTALLED MCP SERVERS (external tool capabilities):"]
@@ -2555,6 +2734,15 @@ def _help_text() -> str:
           /models              List available Copilot models
           /models <number>     Select model by number  (e.g. /models 2)
           /models <name>       Select model by name    (e.g. /models gpt-4o-mini)
+
+        THINK LEVEL (reasoning intensity):
+          /think               Show current level and all options
+          /think off           Fastest, minimal reasoning  (max_tokens=512)
+          /think low           Concise answers             (max_tokens=1024)
+          /think medium        Balanced  (default)         (max_tokens=2048)
+          /think high          Deep, thorough analysis     (max_tokens=4096)
+          The setting is saved to ~/.sapiens2/sapiens_state.json and
+          persists across restarts and updates.
 
         CONVERSATION & MEMORY:
           /new                 Start a new conversation (clears short-term memory; long-term kept)
@@ -2639,6 +2827,7 @@ def _help_text() -> str:
 
         OTHER:
           /update              Update Sapiens2.0 to the latest code (git pull + pip install)
+          /think [level]       View or set reasoning intensity (off/low/medium/high)
           /help  or  /?        Show this help text
           /exit  or  /quit     Exit Sapiens2.0
 
@@ -2908,6 +3097,7 @@ def _print_banner(agent: "AgentCore") -> None:
         print("  [MCP] No MCPs installed. Type /mcp auto <goal> to discover and install one.")
 
     print(f"  [>]  Model: {agent.copilot.get_model()}  (/models to change)")
+    print(f"  [T]  Think level: {agent._think_level}  (/think to change)")
     print()
     print("  Type /help to see all commands. Type your message to start chatting.")
     print("  Tip: Press Ctrl+C while Sapiens2.0 is thinking to cancel the response.")
