@@ -20,7 +20,7 @@ Features:
  10. Queued input: type your next question while the agent is still responding — it is
      queued automatically and processed as soon as the current response finishes.
  11. Resilient error handling: subprocess and tool failures never crash the session;
-     they are surfaced as structured error strings the model can analyse.
+     they are surfaced as structured error strings the model can analyze.
  12. /will command: configure how persistently the agent retries after a failure
      (off / low / medium / high / max).  Setting persists across restarts.
 
@@ -249,7 +249,7 @@ THINK_PROMPT_SUFFIX: Dict[str, str] = {
 # "off"    — no extra retries; fail immediately on first error.
 # "low"    — 1 additional goal-seeking retry after a failure.
 # "medium" — 2 additional retries (default).
-# "high"   — 3 additional retries; agent analyses errors and tries alternatives.
+# "high"   — 3 additional retries; agent analyzes errors and tries alternatives.
 # "max"    — 5 additional retries; maximum persistence.
 WILL_LEVELS: List[str] = ["off", "low", "medium", "high", "max"]
 WILL_DEFAULT_LEVEL: str = "medium"
@@ -2301,7 +2301,7 @@ class AgentCore:
                     "\n\nOne or more tool calls returned errors.  "
                     f"You have approximately {retries_remaining} retry attempt(s) remaining "
                     f"(will_level={self._will_level}).  "
-                    "Please analyse what went wrong, consider an alternative approach, "
+                    "Please analyze what went wrong, consider an alternative approach, "
                     "and try again — do NOT give up yet.  "
                     "If you can achieve the user's goal a different way, do so now."
                 )
@@ -2584,7 +2584,7 @@ class AgentCore:
             descriptions = {
                 "off":    "No retry — stop on first tool failure.",
                 "low":    "1 extra retry after failure; brief error analysis.",
-                "medium": "2 extra retries; agent analyses errors and tries alternatives. (default)",
+                "medium": "2 extra retries; agent analyzes errors and tries alternatives. (default)",
                 "high":   "3 extra retries; persistent goal-seeking with error analysis.",
                 "max":    "5 extra retries; maximum persistence toward the user's goal.",
             }
@@ -3062,9 +3062,9 @@ def _help_text() -> str:
           /will off            No retry — fail immediately on first tool error
           /will low            1 extra retry with error analysis
           /will medium         2 extra retries  (default)
-          /will high           3 extra retries; agent analyses failures and tries alternatives
+          /will high           3 extra retries; agent analyzes failures and tries alternatives
           /will max            5 extra retries; maximum persistence toward the user's goal
-          When a tool call fails and will_level > off, Sapiens analyses the error
+          When a tool call fails and will_level > off, Sapiens analyzes the error
           and tries a different approach instead of giving up immediately.
           The setting is saved to ~/.sapiens2/sapiens_state.json and
           persists across restarts and updates.
