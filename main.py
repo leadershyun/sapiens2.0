@@ -2827,7 +2827,6 @@ def _help_text() -> str:
 
         OTHER:
           /update              Update Sapiens2.0 to the latest code (git pull + pip install)
-          /think [level]       View or set reasoning intensity (off/low/medium/high)
           /help  or  /?        Show this help text
           /exit  or  /quit     Exit Sapiens2.0
 
