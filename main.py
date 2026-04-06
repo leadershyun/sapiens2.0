@@ -1270,7 +1270,7 @@ class CopilotModule:
             except (requests.Timeout, requests.ConnectionError) as e:
                 # Transient network errors — retry with exponential back-off.
                 if attempt < CHAT_API_MAX_RETRIES:
-                    delay = CHAT_API_RETRY_DELAY * (attempt + 1)
+                    delay = CHAT_API_RETRY_DELAY * (2 ** attempt)
                     print(
                         f"[Copilot] Network error (attempt {attempt + 1}/{CHAT_API_MAX_RETRIES + 1}): "
                         f"{e}\n  Retrying in {delay}s..."
@@ -3123,7 +3123,7 @@ class AgentCore:
             if not name:
                 return "[Error] Usage: /skill create <name>"
             if " " in name:
-                return "[Error] Skill names cannot contain spaces.  Use hyphens instead (e.g. web-search)."
+                return "[Error] Skill names cannot contain spaces. Use hyphens instead (e.g. web-search)."
             print(f"  Creating skill: '{name}'")
             print("  Enter a brief one-line description:")
             description = _safe_input("  > ") or ""
