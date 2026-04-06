@@ -23,9 +23,13 @@ Features:
      they are surfaced as structured error strings the model can analyze.
  12. /will command: configure how persistently the agent retries after a failure
      (off / low / medium / high / max).  Setting persists across restarts.
+ 13. First-run bootstrap: `sapiens setup` (or /setup inside the agent) checks Python,
+     Node.js, and essential MCP capabilities (filesystem + browser) and auto-installs
+     anything missing so the agent is immediately usable after installation.
 
 Installation & Usage:
   pip install -e .         # Install once — makes 'sapiens' command available globally
+  sapiens setup            # First-run bootstrap: installs essential MCPs, health checks
   sapiens wakeup           # Start Sapiens2.0 from any directory
 
   Or run directly:
@@ -66,6 +70,7 @@ Key Commands:
   /models [num|name]    List or select available Copilot models
   /think [level]        View or set reasoning intensity: off / low / medium / high
   /will [level]         View or set retry/persistence intensity: off / low / medium / high / max
+  /setup                First-run bootstrap: check + auto-install essential MCPs
   /new                  Start a new conversation (short-term memory cleared)
   /reset                Full reset: long-term memory + model settings cleared
   /update               Update Sapiens2.0 to the latest code automatically
@@ -491,6 +496,198 @@ def _find_node_cmd(name: str) -> str:
 
 
 # ─────────────────────────────────────────────
+#  Bootstrap / first-run setup
+# ─────────────────────────────────────────────
+
+def _run_bootstrap(
+    mcp_module: Optional["MCPModule"] = None,
+    auto_install: bool = True,
+) -> str:
+    """
+    First-run / health-check bootstrap for Sapiens2.0.
+
+    Verifies that the essential runtime dependencies are present and, when
+    *auto_install* is True, automatically installs the two most important MCP
+    capabilities (filesystem + browser/playwright) if Node.js is available.
+
+    Args:
+        mcp_module:   An existing MCPModule to use for state + install.
+                      If None, a temporary one is created (no auth needed).
+        auto_install: Install missing essential MCPs when True (default).
+                      Pass False for a read-only health check.
+
+    Returns:
+        A multi-line status/report string suitable for printing.
+    """
+    # Lazy import to avoid a circular reference at module level.
+    # MCPModule and CopilotModule are defined later in this file.
+    lines: List[str] = []
+    SEP = "  " + "-" * 54
+
+    lines.append("")
+    lines.append("  Sapiens2.0 -- Environment Setup & Health Check")
+    lines.append(SEP)
+    lines.append("")
+
+    # ── 1. Python ────────────────────────────────────────────
+    py_ver = (
+        f"{sys.version_info.major}.{sys.version_info.minor}"
+        f".{sys.version_info.micro}"
+    )
+    lines.append(f"  {'Python':<24} OK  ({py_ver})")
+
+    # ── 2. Node.js ───────────────────────────────────────────
+    node_cmd = _find_node_cmd("node")
+    npm_cmd  = _find_node_cmd("npm")
+
+    node_ok = False
+    npm_ok  = False
+    node_version = ""
+    npm_version  = ""
+
+    try:
+        r = subprocess.run(
+            [node_cmd, "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            node_version = (r.stdout or "").strip()
+            node_ok = True
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    try:
+        r = subprocess.run(
+            [npm_cmd, "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            npm_version = (r.stdout or "").strip()
+            npm_ok = True
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    if node_ok:
+        lines.append(f"  {'Node.js':<24} OK  ({node_version})")
+    else:
+        lines.append(f"  {'Node.js':<24} NOT FOUND")
+
+    if npm_ok:
+        lines.append(f"  {'npm':<24} OK  ({npm_version})")
+    else:
+        lines.append(f"  {'npm':<24} NOT FOUND")
+
+    lines.append("")
+
+    # ── 3. Essential MCP capabilities ────────────────────────
+    lines.append("  Essential MCP capabilities:")
+    lines.append("")
+
+    # Create a temporary MCPModule if none was provided (no auth required).
+    if mcp_module is None:
+        # Import is at module level; CopilotModule defined below — safe here
+        # because this function is only called at runtime, not at import time.
+        mcp_module = MCPModule(CopilotModule())  # type: ignore[arg-type]
+
+    installed = mcp_module.list_installed()
+
+    fs_installed = "filesystem" in installed
+    fs_status = "INSTALLED" if fs_installed else "not installed"
+    lines.append(f"  {'filesystem MCP':<24} {fs_status}")
+
+    browser_mcp: Optional[str] = None
+    for _name in ("playwright", "puppeteer"):
+        if _name in installed:
+            browser_mcp = _name
+            break
+    browser_status = f"INSTALLED ({browser_mcp})" if browser_mcp else "not installed"
+    lines.append(f"  {'browser MCP':<24} {browser_status}")
+
+    lines.append("")
+
+    # ── 4. Auto-install missing essentials ───────────────────
+    to_install = []
+    if not fs_installed:
+        to_install.append("filesystem")
+    if browser_mcp is None:
+        to_install.append("playwright")
+
+    if to_install and auto_install:
+        if not node_ok:
+            lines.append(SEP)
+            lines.append("  [!] Node.js is required for browser and filesystem MCPs.")
+            lines.append("")
+            lines.append("  Install Node.js (LTS) from: https://nodejs.org/en/download/")
+            lines.append("")
+            lines.append("  After installing:")
+            lines.append("    1. Close and re-open your terminal / PowerShell window")
+            lines.append("    2. Run:  sapiens setup")
+            lines.append("       or type /setup inside Sapiens2.0")
+            lines.append("")
+        else:
+            lines.append(f"  Installing missing essentials: {', '.join(to_install)}")
+            lines.append("")
+            for _mcp_name in to_install:
+                entry = next(
+                    (e for e in MCP_CURATED_REGISTRY if e["name"] == _mcp_name),
+                    None,
+                )
+                if not entry:
+                    lines.append(f"    [!] '{_mcp_name}' not found in registry -- skipping.")
+                    continue
+                print(f"  [*] Installing '{_mcp_name}'...", flush=True)
+                ok, msg = mcp_module.install(entry)
+                if ok:
+                    lines.append(f"    '{_mcp_name}' ........... OK")
+                else:
+                    short_msg = msg.split("\n")[0][:80]
+                    lines.append(f"    '{_mcp_name}' ........... FAILED -- {short_msg}")
+            lines.append("")
+    elif to_install:
+        lines.append("  Tip: run /setup to auto-install missing essentials.")
+        lines.append("")
+
+    # ── 5. Summary ───────────────────────────────────────────
+    lines.append(SEP)
+
+    # Re-read installed state after potential installs
+    installed_after = mcp_module.list_installed()
+    fs_ready      = "filesystem" in installed_after
+    browser_ready = any(n in installed_after for n in ("playwright", "puppeteer"))
+
+    all_ok = node_ok and npm_ok and fs_ready and browser_ready
+    if all_ok:
+        lines.append("  [OK] All essential dependencies are ready.")
+        lines.append("")
+        lines.append("  Next steps:")
+        lines.append("    /auth          -- link your GitHub Copilot account")
+        lines.append("    /mcp list      -- browse all available MCP servers")
+        lines.append("    /help          -- view all commands")
+    else:
+        issues: List[str] = []
+        if not node_ok:
+            issues.append(
+                "Node.js not found -- install LTS from https://nodejs.org"
+            )
+        if not fs_ready:
+            issues.append(
+                "filesystem MCP not installed -- run: /mcp install filesystem"
+            )
+        if not browser_ready:
+            issues.append(
+                "browser MCP not installed -- run: /mcp install playwright"
+            )
+        lines.append("  [!] Some items need attention:")
+        for _issue in issues:
+            lines.append(f"      - {_issue}")
+        lines.append("")
+        lines.append("  Fix the issues above, then run /setup again to verify.")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
 #  Stdin reader — queued input while working
 # ─────────────────────────────────────────────
 
@@ -583,7 +780,7 @@ class Spinner:
     _FRAMES = ["|", "/", "-", "\\"]
     _INTERVAL = 0.12  # seconds between frames
 
-    def __init__(self, message: str = "  [Sapiens2.0] Thinking") -> None:
+    def __init__(self, message: str = "  Sapiens: Thinking") -> None:
         self._message = message
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -2711,7 +2908,7 @@ class AgentCore:
             # Print any narrative text the model wrote around the tool calls
             clean_text = TOOL_CALL_RE.sub("", response).strip()
             if clean_text:
-                print(f"[Sapiens2.0] {clean_text}")
+                print(f"\n  Sapiens: {clean_text}\n")
 
             # Execute each tool call and collect results
             tool_results: List[str] = []
@@ -2960,6 +3157,10 @@ class AgentCore:
         # ── Skill commands ────────────────────────
         if cmd == "/skill":
             return self._handle_skill_command(arg1, arg2, raw)
+
+        # ── Setup / bootstrap ────────────────────
+        if cmd == "/setup":
+            return _run_bootstrap(mcp_module=self.mcp, auto_install=True)
 
         # ── Update ───────────────────────────────
         if cmd == "/update":
@@ -3655,8 +3856,9 @@ def _help_text() -> str:
 
         INSTALLATION (run once):
           pip install -e .           Install — makes 'sapiens' command available globally
+          sapiens setup              First-run bootstrap: installs Node.js MCPs, checks
+                                     Python/Node environment, reports what is ready
           sapiens wakeup             Start Sapiens2.0 from any terminal/PowerShell window
-
         AUTHENTICATION (GitHub device flow — same as OpenClaw):
           /auth                Start GitHub device flow (recommended)
                                → note the code shown, visit https://github.com/login/device
@@ -3818,6 +4020,10 @@ def _help_text() -> str:
           See README.md for full setup instructions.
 
         OTHER:
+          /setup               Run first-run bootstrap: checks Python, Node.js, and
+                               essential MCPs; auto-installs filesystem + browser MCPs
+                               when Node.js is available.
+                               Also available as: sapiens setup  (standalone CLI command)
           /update              Update Sapiens2.0 to the latest code (git pull + pip install)
           /will [level]        View or set retry/persistence intensity (off/low/medium/high/max)
           /help  or  /?        Show this help text
@@ -4033,71 +4239,92 @@ def _print_banner(agent: "AgentCore") -> None:
 
     # Inner content width (characters between the | borders).
     # All content strings are padded/truncated to exactly this width.
-    INNER = 60
+    INNER = 62
 
     def _bline(content: str = "") -> str:
         """Return one box content line, padded to INNER chars."""
         return "  |" + content.ljust(INNER) + "|"
 
-    border = "  +" + "=" * INNER + "+"
+    def _hline(char: str = "=") -> str:
+        """Return a full horizontal border line."""
+        return "  +" + char * INNER + "+"
 
-    # ASCII art for "Sapiens" — trailing spaces intentionally stripped;
-    # _bline() pads every line to exactly INNER characters via ljust().
+    # ASCII art logo lines — _bline() pads every line to INNER chars.
     logo = [
-        "   ____             _                 ____   ___",
-        "  / ___|  __ _ _ __|_) ___ _ __  ___ |___ \\ / _ \\",
+        "   ____             _                 ____   ___  ",
+        "  / ___|  __ _ _ __|_) ___ _ __  ___ |___ \\ / _ \\ ",
         "  \\___ \\ / _` | '_ \\ |/ _ \\ '_ \\/ __|  __) | | |",
         "   ___) | (_| | |_) | |  __/ | | \\__ \\ / __/| |_|",
-        "  |____/ \\__,_| .__/|_|\\___|_| |_|___/|_____|\\___/  2.0",
+        "  |____/ \\__,_| .__/|_|\\___|_| |_|___/|_____|\\___/  v2.0",
         "              |_|",
     ]
 
     print()
-    print(border)
+    print(_hline("="))
     print(_bline())
     for art_line in logo:
         print(_bline(art_line))
     print(_bline())
-    print(_bline("  AI Agent  *  Computer Control  *  Long-Term Memory"))
-    print(_bline("  GitHub Copilot powered"))
+    print(_bline("  AI Agent  *  Computer Control  *  Long-Term Memory  "))
+    print(_bline("  Powered by GitHub Copilot                            "))
     print(_bline())
-    print(border)
+    print(_hline("="))
     print()
 
-    # Auth status (plain text, no emoji that may misrender in PowerShell)
+    # ── Status table ──────────────────────────────────────────────────────────
+    # Auth
     if agent.copilot.is_authenticated():
         saved = os.path.exists(AUTH_CONFIG_FILE)
-        note = "  (saved -- auto-login enabled)" if saved else ""
-        print(f"  [OK] GitHub account linked{note}")
+        auth_val = "Linked" + (" (auto-login)" if saved else "")
+        auth_marker = "[+]"
     else:
-        print("  [i]  Not authenticated. Type /auth to link your GitHub account.")
-        print("       Visit https://github.com/login/device and enter the code shown.")
+        auth_val = "Not linked  --  type /auth to connect"
+        auth_marker = "[ ]"
 
+    model_val = agent.copilot.get_model()
+
+    # Memory
     lt_mem = agent.memory.get_long_term()
-    if lt_mem:
-        print(f"  [M]  Long-term memory: {len(lt_mem)} entries loaded  (/memory to view)")
+    mem_val = f"{len(lt_mem)} entries" if lt_mem else "empty"
 
+    # Think / Will
+    think_val = agent._think_level
+    will_val  = agent._will_level
+
+    # MCPs
     installed_mcps = agent.mcp.list_installed()
     if installed_mcps:
-        names = ", ".join(installed_mcps.keys())
-        print(f"  [MCP] {len(installed_mcps)} MCP server(s) ready: {names}  (/mcp to manage)")
+        mcp_names = ", ".join(installed_mcps.keys())
+        mcp_val = f"{len(installed_mcps)} ready: {mcp_names}"
     else:
-        print("  [MCP] No MCPs installed. Type /mcp auto <goal> to discover and install one.")
+        mcp_val = "none  --  run /setup to install essentials"
 
+    # Skills
     skills = agent.skills.list_skills()
     if skills:
-        skill_names = ", ".join(s["name"] for s in skills[:5])
-        suffix = f"  +{len(skills) - 5} more" if len(skills) > 5 else ""
-        print(f"  [SK] {len(skills)} skill(s) defined: {skill_names}{suffix}  (/skill to manage)")
+        skill_names = ", ".join(s["name"] for s in skills[:3])
+        skill_suffix = f" +{len(skills) - 3} more" if len(skills) > 3 else ""
+        skill_val = f"{len(skills)} defined: {skill_names}{skill_suffix}"
     else:
-        print("  [SK] No skills defined. Type /skill create <name> to add one.")
+        skill_val = "none  --  /skill create <name> to add"
 
-    print(f"  [>]  Model: {agent.copilot.get_model()}  (/models to change)")
-    print(f"  [T]  Think level: {agent._think_level}  (/think to change)")
+    COL = 22  # label column width
+
+    print(_hline("-"))
+    print(f"  {auth_marker} {'Auth':<{COL}} {auth_val}")
+    print(f"      {'Model':<{COL}} {model_val}")
+    print(f"  [M] {'Memory':<{COL}} {mem_val}")
+    print(f"  [~] {'Think / Will':<{COL}} {think_val} / {will_val}")
+    print(f"  [P] {'MCPs':<{COL}} {mcp_val}")
+    print(f"  [S] {'Skills':<{COL}} {skill_val}")
+    print(_hline("-"))
     print()
-    print("  Type /help to see all commands. Type your message to start chatting.")
-    print("  Tip: Press Ctrl+C to cancel a response. Type your next message at any time")
-    print("       while the agent is thinking -- it will be queued automatically.")
+    print("  Type your message to start chatting, or use a slash command:")
+    print("    /help   -- all commands       /auth  -- link GitHub Copilot")
+    print("    /setup  -- first-run config   /mcp   -- manage MCP servers")
+    print()
+    print("  Tip: Press Ctrl+C to cancel a response.")
+    print("       You can type your next message while Sapiens is responding.")
     print()
 
 
@@ -4180,10 +4407,14 @@ def main() -> None:
     _start_stdin_reader()
 
     while True:
-        user_input_raw = _safe_input("[You] ")
+        # Thin visual separator between turns makes long sessions easier to scan
+        sys.stdout.write("  " + "-" * 54 + "\n")
+        sys.stdout.flush()
+
+        user_input_raw = _safe_input("  You: ")
         if user_input_raw is None:
             # EOF — stdin was closed (e.g. piped input exhausted)
-            print("\nGoodbye!")
+            print("\n  Goodbye!")
             agent.mcp.shutdown()
             break
         user_input = user_input_raw.strip()
@@ -4196,7 +4427,11 @@ def main() -> None:
         if user_input.startswith("/"):
             response = agent.process(user_input)
             if response:
-                print(f"[Sapiens2.0] {response}\n")
+                print()
+                # Indent each line of the response for visual consistency
+                for _line in response.splitlines():
+                    print(f"  {_line}")
+                print()
             continue
 
         # ── Chat messages run in a background thread so Ctrl+C can cancel ──
@@ -4218,9 +4453,8 @@ def main() -> None:
         worker.start()
 
         print(
-            "  [Thinking...] "
-            "(you can type your next message now -- it will be queued)\n",
-            end="",
+            "  [*] Working...  (you can type your next message -- it will be queued)",
+            end="\n",
             flush=True,
         )
 
@@ -4233,12 +4467,14 @@ def main() -> None:
             if active is not None:
                 active.stop()
                 agent._active_spinner = None
-            print("\n\n  [Cancelled] Response generation stopped.  (Ctrl+C)\n")
+            print("\n  [Cancelled] Response stopped.  (Ctrl+C)\n")
             continue
 
         response = result_box[0]
         if response:
-            print(f"[Sapiens2.0] {response}\n")
+            print()
+            print(f"  Sapiens: {response}")
+            print()
 
 
 def cli_entry() -> None:
@@ -4250,12 +4486,33 @@ def cli_entry() -> None:
       sapiens wakeup --token <TOKEN>          Start with a specific GitHub token
       sapiens wakeup --discord                Start in Discord bot mode
       sapiens wakeup --discord --discord-token <BOT_TOKEN>
+      sapiens setup                           Run first-run environment bootstrap
     """
     args = sys.argv[1:]
 
-    if not args or args[0] != "wakeup":
+    if not args:
         print("Usage: sapiens wakeup [--token GITHUB_TOKEN] [--client-id CLIENT_ID]")
         print("       sapiens wakeup --discord [--discord-token DISCORD_BOT_TOKEN]")
+        print("       sapiens setup")
+        print("       sapiens wakeup --help")
+        sys.exit(1)
+
+    subcommand = args[0]
+
+    # ── sapiens setup ─────────────────────────────────────────────────────────
+    if subcommand == "setup":
+        # Run the bootstrap health-check + auto-install standalone (no full
+        # agent start needed — works before /auth is performed).
+        print("[Setup] Starting environment setup...")
+        report = _run_bootstrap(mcp_module=None, auto_install=True)
+        print(report)
+        return
+
+    # ── sapiens wakeup ────────────────────────────────────────────────────────
+    if subcommand != "wakeup":
+        print("Usage: sapiens wakeup [--token GITHUB_TOKEN] [--client-id CLIENT_ID]")
+        print("       sapiens wakeup --discord [--discord-token DISCORD_BOT_TOKEN]")
+        print("       sapiens setup")
         print("       sapiens wakeup --help")
         sys.exit(1)
 

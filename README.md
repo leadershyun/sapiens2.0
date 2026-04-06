@@ -2,13 +2,16 @@
 
 Sapiens2.0 is an AI agent prototype powered by GitHub Copilot.  
 It features computer control, long-term memory, a polished CLI experience,
-a **thinking indicator**, **force-cancel support**, and a **Discord bot mode**.
+a **thinking indicator**, **force-cancel support**, a **Discord bot mode**, and an
+**automatic first-run bootstrap** that installs essential tools so the agent is
+immediately usable after installation.
 
 ## Requirements
 
 - Python 3.8+
 - Active GitHub Copilot subscription
 - [requests](https://pypi.org/project/requests/) package
+- Node.js (LTS) — for browser and file-system MCP tools *(auto-detected; guided install if missing)*
 - [discord.py](https://pypi.org/project/discord.py/) *(optional — required only for Discord bot mode)*
 
 ## Installation (PowerShell / terminal)
@@ -21,6 +24,77 @@ pip install -e .
 
 The `pip install -e .` step installs the `sapiens` command globally so you can start
 Sapiens2.0 from any directory.
+
+## First-Run Bootstrap (`sapiens setup`)
+
+After installing, run the bootstrap command once to configure the essential capabilities:
+
+```powershell
+sapiens setup
+```
+
+This command:
+
+1. **Checks your environment** — Python version, Node.js, and npm are verified.
+2. **Auto-installs essential MCPs** — if Node.js is available, the
+   `filesystem` MCP (file/directory control) and the `playwright` MCP
+   (browser automation) are installed automatically via npm.
+3. **Reports readiness** — a health-check summary shows what is ready and what
+   still needs attention, with clear instructions for any missing items.
+
+### Example output
+
+```
+  Sapiens2.0 -- Environment Setup & Health Check
+  ------------------------------------------------------
+
+  Python                   OK  (3.11.4)
+  Node.js                  OK  (v20.10.0)
+  npm                      OK  (10.2.3)
+
+  Essential MCP capabilities:
+
+  filesystem MCP           not installed
+  browser MCP              not installed
+
+  Installing missing essentials: filesystem, playwright
+    'filesystem' ........... OK
+    'playwright' ........... OK
+
+  ------------------------------------------------------
+  [OK] All essential dependencies are ready.
+
+  Next steps:
+    /auth          -- link your GitHub Copilot account
+    /mcp list      -- browse all available MCP servers
+    /help          -- view all commands
+```
+
+### If Node.js is not installed
+
+The bootstrap will detect the missing runtime and give you a direct download link:
+
+```
+  [!] Node.js is required for browser and filesystem MCPs.
+
+  Install Node.js (LTS) from: https://nodejs.org/en/download/
+
+  After installing:
+    1. Close and re-open your terminal / PowerShell window
+    2. Run:  sapiens setup
+```
+
+### Re-running the bootstrap
+
+You can re-run the health check at any time — from the command line or inside the agent:
+
+```powershell
+sapiens setup          # standalone CLI command
+```
+
+```
+/setup                 # slash command inside Sapiens2.0
+```
 
 ## Running Sapiens2.0
 
@@ -40,6 +114,48 @@ Or pass a GitHub token directly:
 
 ```powershell
 sapiens wakeup --token ghp_xxxxxxxxxxxx
+```
+
+## PowerShell Chat UI
+
+The terminal interface displays a clean status dashboard at startup:
+
+```
+  +==============================================================+
+  |   ____             _                 ____   ___              |
+  |  / ___|  __ _ _ __|_) ___ _ __  ___ |___ \ / _ \            |
+  |  \___ \ / _` | '_ \ |/ _ \ '_ \/ __|  __) | | |             |
+  |   ___) | (_| | |_) | |  __/ | | \__ \ / __/| |_|            |
+  |  |____/ \__,_| .__/|_|\___|_| |_|___/|_____|\___/  v2.0     |
+  |              |_|                                             |
+  |  AI Agent  *  Computer Control  *  Long-Term Memory         |
+  +==============================================================+
+
+  +--------------------------------------------------------------+
+  [+] Auth                   Linked (auto-login)
+      Model                  gpt-4o
+  [M] Memory                 3 entries
+  [~] Think / Will           medium / medium
+  [P] MCPs                   2 ready: filesystem, playwright
+  [S] Skills                 none  --  /skill create <name> to add
+  +--------------------------------------------------------------+
+```
+
+Conversations use a clear turn-by-turn layout with thin separators:
+
+```
+  ------------------------------------------------------
+  You: what files are in this folder?
+
+  [*] Working...  (you can type your next message -- it will be queued)
+
+  Sapiens: Thinking \
+
+  Sapiens: Here are the files:
+  ⚙  /ls .
+     main.py
+     README.md
+     pyproject.toml
 ```
 
 ## Thinking / Responding Indicator
@@ -213,6 +329,7 @@ You can also use slash commands directly:
 | `/status` | Show current auth status and selected model |
 | `/models` | List available Copilot models |
 | `/models <number\|name>` | Select model (e.g. `/models 2` or `/models gpt-4o-mini`) |
+| `/setup` | First-run bootstrap: check + auto-install essential MCPs |
 | `/new` | Start a new conversation (clears short-term memory) |
 | `/reset` | Full reset: clears long-term memory + model settings |
 | `/memory` | View current long-term memory contents |
