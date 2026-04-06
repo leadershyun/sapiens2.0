@@ -6,15 +6,49 @@ a **thinking indicator**, **force-cancel support**, a **Discord bot mode**, and 
 **automatic first-run bootstrap** that installs essential tools so the agent is
 immediately usable after installation.
 
-## Requirements
+## One-Line Install (Windows / PowerShell)
 
-- Python 3.8+
-- Active GitHub Copilot subscription
-- [requests](https://pypi.org/project/requests/) package
-- Node.js (LTS) — for browser and file-system MCP tools *(auto-detected; guided install if missing)*
-- [discord.py](https://pypi.org/project/discord.py/) *(optional — required only for Discord bot mode)*
+Open **PowerShell** (5.1 or later — the one built into Windows is fine) and run:
 
-## Installation (PowerShell / terminal)
+```powershell
+iwr https://raw.githubusercontent.com/leadershyun/sapiens2.0/main/install.ps1 | iex
+```
+
+That single command will:
+
+1. Check that **Python 3.8+** and **Git** are installed (and guide you if they are not).
+2. **Clone** the repository into `%USERPROFILE%\sapiens2.0` (or update it if already present).
+3. Run **`pip install -e .`** to register the `sapiens` command globally.
+4. Run **`sapiens setup`** to verify Node.js / npm and auto-install the essential
+   filesystem and Playwright MCP tools.
+5. Print the next steps so you can start chatting right away.
+
+### Prerequisites
+
+| Tool | Required? | Where to get it |
+|------|-----------|-----------------|
+| Python 3.8+ | **Yes** | <https://www.python.org/downloads/> — tick *"Add Python to PATH"* |
+| Git | **Yes** | <https://git-scm.com/download/win> |
+| Node.js (LTS) | Recommended | <https://nodejs.org/en/download/> — needed for MCP tools |
+| GitHub Copilot subscription | **Yes** | <https://github.com/features/copilot> |
+
+### After the installer finishes
+
+```powershell
+sapiens wakeup
+```
+
+> If `sapiens` is not recognised yet, open a **new** PowerShell window first so
+> the updated PATH takes effect, then run `sapiens wakeup`.
+
+First-time users should then run `/auth` inside Sapiens2.0 to link their GitHub
+Copilot account via the device-flow login.
+
+---
+
+## Manual Installation (PowerShell / terminal)
+
+If you prefer to set things up yourself:
 
 ```powershell
 git clone https://github.com/leadershyun/sapiens2.0.git
@@ -24,6 +58,14 @@ pip install -e .
 
 The `pip install -e .` step installs the `sapiens` command globally so you can start
 Sapiens2.0 from any directory.
+
+## Requirements
+
+- Python 3.8+
+- Active GitHub Copilot subscription
+- [requests](https://pypi.org/project/requests/) package
+- Node.js (LTS) — for browser and file-system MCP tools *(auto-detected; guided install if missing)*
+- [discord.py](https://pypi.org/project/discord.py/) *(optional — required only for Discord bot mode)*
 
 ## First-Run Bootstrap (`sapiens setup`)
 
