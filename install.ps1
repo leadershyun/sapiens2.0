@@ -84,7 +84,7 @@ foreach ($candidate in @('python', 'python3', 'py')) {
     if (Find-Command $candidate) {
         # Confirm it is actually Python 3.8+
         try {
-            $verOut = & $candidate -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')" 2>$null
+            $verOut = & $candidate -c "import sys; v=sys.version_info; print(str(v.major)+'.'+str(v.minor)+'.'+str(v.micro))" 2>$null
             if ($LASTEXITCODE -eq 0 -and $verOut -match '^\d+\.\d+') {
                 $parts  = $verOut.Trim().Split('.')
                 $major  = [int]$parts[0]
@@ -163,8 +163,9 @@ if (Test-Path (Join-Path $installDir '.git')) {
 }
 else {
     if (Test-Path $installDir) {
-        Write-Warn "$installDir exists but is not a git repository -- installing alongside it."
+        Write-Warn "$installDir exists but is not a git repository -- installing into a new folder."
         $installDir = Join-Path $env:USERPROFILE 'sapiens2.0-new'
+        Write-Warn "New install location: $installDir"
     }
     Write-Step "Cloning repository into $installDir ..."
     & git clone $repoUrl $installDir 2>&1 | ForEach-Object { "    $_" } | Write-Host
@@ -226,6 +227,8 @@ else {
     Push-Location $installDir
     try {
         & $pythonCmd -c "import sys; sys.path.insert(0, '.'); sys.argv = ['sapiens', 'setup']; import main; main.cli_entry()"
+        # 'main' is the py-module registered in pyproject.toml; 'cli_entry' is the
+        # console-scripts entry point — both are defined in main.py at the repo root.
     }
     finally {
         Pop-Location
