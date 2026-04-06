@@ -247,6 +247,22 @@ THINK_PROMPT_SUFFIX: Dict[str, str] = {
     ),
 }
 
+# ── Chat API retry settings ──────────────────────────────────────────────────
+# Number of *additional* attempts after the first timeout/connection failure.
+# Only transient network errors are retried; auth/bad-request errors are not.
+CHAT_API_MAX_RETRIES: int = 2
+# Initial delay (seconds) before the first retry.  Doubles on each subsequent
+# attempt (exponential back-off) so a flaky connection gets a chance to recover
+# without hammering the API.
+CHAT_API_RETRY_DELAY: int = 3
+
+# ── Long-term memory bounds ───────────────────────────────────────────────────
+# Maximum number of key/value entries in long-term memory.  When this limit is
+# exceeded after an automatic extraction pass, the oldest entries are pruned so
+# memory never grows unboundedly.  The model can also prune explicitly via the
+# /memory-delete agent tool.
+MEMORY_MAX_ENTRIES: int = 100
+
 # ── /will setting ────────────────────────────────────────────────────────────
 # Controls how persistently the agent retries after a failure before giving up.
 # "off"    — no extra retries; fail immediately on first error.
@@ -271,6 +287,9 @@ WILL_EXTRA_RETRIES: Dict[str, int] = {
 
 # Persistent MCP state (installed servers, etc.) — stored next to auth config
 MCP_STATE_FILE = os.path.join(AUTH_CONFIG_DIR, "mcp_state.json")
+
+# Persistent skills file — stored in ~/.sapiens2/ alongside other user data.
+SKILLS_FILE = os.path.join(AUTH_CONFIG_DIR, "skills.json")
 
 # GitHub REST API endpoints for MCP discovery
 GITHUB_SEARCH_API = "https://api.github.com/search/repositories"
@@ -713,14 +732,56 @@ class MemoryModule:
             print(f"[Memory] Failed to save long-term memory: {e}")
 
     def update_long_term(self, updates: Dict[str, str]) -> None:
-        """Update long-term memory and save to file."""
+        """Update long-term memory and save to file.
+
+        After applying *updates*, if the total entry count exceeds
+        MEMORY_MAX_ENTRIES the oldest entries are pruned automatically so
+        memory never grows without bound.
+        """
         if updates:
             self._long_term.update({str(k): str(v) for k, v in updates.items()})
+            if len(self._long_term) > MEMORY_MAX_ENTRIES:
+                pruned = self.prune_to_limit(MEMORY_MAX_ENTRIES)
+                if pruned > 0:
+                    print(
+                        f"[Memory] Auto-pruned {pruned} old entr{'y' if pruned == 1 else 'ies'} "
+                        f"(limit: {MEMORY_MAX_ENTRIES})."
+                    )
             self._save()
 
     def get_long_term(self) -> Dict[str, str]:
         """Return all long-term memory entries."""
         return dict(self._long_term)
+
+    def delete_key(self, key: str) -> bool:
+        """Delete a specific long-term memory entry by key.
+
+        Returns:
+            True if the key existed and was removed, False if it was not found.
+        """
+        if key in self._long_term:
+            del self._long_term[key]
+            self._save()
+            return True
+        return False
+
+    def prune_to_limit(self, max_entries: int) -> int:
+        """Remove the *oldest* entries until at most *max_entries* remain.
+
+        Python 3.7+ dicts preserve insertion order, so the entries that were
+        added first are considered the oldest.
+
+        Returns:
+            The number of entries that were removed.
+        """
+        excess = len(self._long_term) - max_entries
+        if excess <= 0:
+            return 0
+        keys_to_remove = list(self._long_term.keys())[:excess]
+        for k in keys_to_remove:
+            del self._long_term[k]
+        self._save()
+        return excess
 
     def get_long_term_context(self) -> str:
         """Return long-term memory formatted for inclusion in the system prompt."""
@@ -1132,6 +1193,10 @@ class CopilotModule:
         """
         Call the Copilot Chat Completions API with a conversation history.
 
+        Transient network errors (timeouts, connection resets) are retried up to
+        CHAT_API_MAX_RETRIES times with exponential back-off before giving up.
+        HTTP errors (auth failures, bad requests) are never retried.
+
         Args:
             system_prompt: System prompt content.
             messages: Conversation messages [{role, content}, ...].
@@ -1153,52 +1218,75 @@ class CopilotModule:
             "temperature": 0.2,
         }
 
-        try:
-            resp = requests.post(
-                COPILOT_CHAT_URL,
-                headers={
-                    "Authorization": f"Bearer {copilot_token}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "Copilot-Integration-Id": "vscode-chat",
-                    "Editor-Version": _EDITOR_VERSION,
-                    "Editor-Plugin-Version": _PLUGIN_VERSION,
-                    "User-Agent": _USER_AGENT,
-                    "X-GitHub-Api-Version": _GH_CHAT_API_VERSION,
-                    "openai-intent": "conversation-panel",
-                },
-                json=payload,
-                timeout=30,
-            )
-            resp.raise_for_status()
-        except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "?"
-            if status == 401:
-                print(
-                    "[Copilot Error] Copilot API auth failed (HTTP 401). Token may have expired.\n"
-                    "  The token will be renewed automatically. If this persists, run /auth again."
+        headers = {
+            "Authorization": f"Bearer {copilot_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Copilot-Integration-Id": "vscode-chat",
+            "Editor-Version": _EDITOR_VERSION,
+            "Editor-Plugin-Version": _PLUGIN_VERSION,
+            "User-Agent": _USER_AGENT,
+            "X-GitHub-Api-Version": _GH_CHAT_API_VERSION,
+            "openai-intent": "conversation-panel",
+        }
+
+        resp = None
+        for attempt in range(CHAT_API_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    COPILOT_CHAT_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
                 )
-                self._copilot_token = None  # Clear expired token
-            elif status == 403:
-                print(
-                    "[Copilot Error] Copilot API access denied (HTTP 403).\n"
-                    "  Check your Copilot subscription: https://github.com/settings/copilot"
-                )
-            elif status == 404:
-                print(
-                    "[Copilot Error] Copilot Chat API endpoint not found (HTTP 404).\n"
-                    "  Verify the model name or API address."
-                )
-            elif status == 422:
-                print(
-                    "[Copilot Error] Invalid request format (HTTP 422).\n"
-                    "  Check the model name and request parameters."
-                )
+                resp.raise_for_status()
+            except requests.HTTPError as e:
+                # HTTP errors are not retried — they indicate a definitive failure.
+                status = e.response.status_code if e.response is not None else "?"
+                if status == 401:
+                    print(
+                        "[Copilot Error] Copilot API auth failed (HTTP 401). Token may have expired.\n"
+                        "  The token will be renewed automatically. If this persists, run /auth again."
+                    )
+                    self._copilot_token = None  # Clear expired token
+                elif status == 403:
+                    print(
+                        "[Copilot Error] Copilot API access denied (HTTP 403).\n"
+                        "  Check your Copilot subscription: https://github.com/settings/copilot"
+                    )
+                elif status == 404:
+                    print(
+                        "[Copilot Error] Copilot Chat API endpoint not found (HTTP 404).\n"
+                        "  Verify the model name or API address."
+                    )
+                elif status == 422:
+                    print(
+                        "[Copilot Error] Invalid request format (HTTP 422).\n"
+                        "  Check the model name and request parameters."
+                    )
+                else:
+                    print(f"[Copilot Error] Copilot Chat API call failed (HTTP {status}): {e}")
+                return None
+            except (requests.Timeout, requests.ConnectionError) as e:
+                # Transient network errors — retry with exponential back-off.
+                if attempt < CHAT_API_MAX_RETRIES:
+                    delay = CHAT_API_RETRY_DELAY * (2 ** attempt)
+                    print(
+                        f"[Copilot] Network error (attempt {attempt + 1}/{CHAT_API_MAX_RETRIES + 1}): "
+                        f"{e}\n  Retrying in {delay}s..."
+                    )
+                    time.sleep(delay)
+                    continue
+                print(f"[Copilot Error] Network error (Chat API): {e}")
+                return None
+            except requests.RequestException as e:
+                print(f"[Copilot Error] Network error (Chat API): {e}")
+                return None
             else:
-                print(f"[Copilot Error] Copilot Chat API call failed (HTTP {status}): {e}")
-            return None
-        except requests.RequestException as e:
-            print(f"[Copilot Error] Network error (Chat API): {e}")
+                # Request succeeded — parse and return.
+                break
+        else:
+            # All retry attempts exhausted without a successful response.
             return None
 
         try:
@@ -2097,7 +2185,152 @@ class MCPModule:
 
 
 # ─────────────────────────────────────────────
-#  Module 5: Agent Core
+#  Module 5: Skills System
+# ─────────────────────────────────────────────
+
+class SkillsModule:
+    """
+    Reusable skill system for Sapiens2.0.
+
+    A "skill" is a named, stored workflow or capability description that the
+    agent can load and apply to perform a specific category of task reliably
+    and consistently — similar in spirit to Claude-style skills.
+
+    Skills persist to ~/.sapiens2/skills.json so they survive restarts and
+    "sapiens update" runs.
+
+    User commands:
+      /skill                  — list skills
+      /skill list             — same
+      /skill show <name>      — show skill details and content
+      /skill create <name>    — interactively create a new skill
+      /skill delete <name>    — delete a skill (prompts for confirmation)
+      /skill use <name> [task]— inject the skill into an agent chat session
+
+    Agent tools (callable from <tool> tags inside the agent loop):
+      /skill-list                              — list available skills
+      /skill-load <name>                       — load & return skill content
+      /skill-save <name> {json}               — create/update a skill
+        json: {"description":"...","content":"...","tags":["..."]}
+    """
+
+    def __init__(self, skills_file: str = SKILLS_FILE) -> None:
+        self._skills_file = skills_file
+        self._skills: Dict[str, dict] = {}
+        self._load()
+
+    # ── Persistence ─────────────────────────────
+
+    def _load(self) -> None:
+        """Load skills from disk."""
+        if not os.path.exists(self._skills_file):
+            return
+        try:
+            with open(self._skills_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._skills = data
+        except (json.JSONDecodeError, IOError):
+            self._skills = {}
+
+    def _save(self) -> None:
+        """Persist skills to disk."""
+        try:
+            os.makedirs(os.path.dirname(self._skills_file), exist_ok=True)
+            with open(self._skills_file, "w", encoding="utf-8") as f:
+                json.dump(self._skills, f, ensure_ascii=False, indent=2)
+        except IOError as e:
+            print(f"[Skills] Failed to save skills: {e}")
+
+    # ── Public API ──────────────────────────────
+
+    def list_skills(self) -> List[dict]:
+        """Return all skills as a list of dicts."""
+        return list(self._skills.values())
+
+    def get_skill(self, name: str) -> Optional[dict]:
+        """Return a skill by name, or None if not found."""
+        return self._skills.get(name)
+
+    def save_skill(
+        self,
+        name: str,
+        description: str,
+        content: str,
+        tags: Optional[List[str]] = None,
+    ) -> str:
+        """Create or update a skill.
+
+        Args:
+            name:        Short identifier (no spaces recommended).
+            description: One-line summary of what the skill does.
+            content:     Full instructions / workflow for the skill.
+            tags:        Optional list of keyword tags for discovery.
+
+        Returns:
+            A status message string.
+        """
+        existing = self._skills.get(name)
+        now = time.strftime("%Y-%m-%dT%H:%M:%S")
+        skill: dict = {
+            "name": name,
+            "description": description,
+            "content": content,
+            "tags": tags or [],
+            "created_at": existing.get("created_at", now) if existing else now,
+            "updated_at": now,
+            "used_count": existing.get("used_count", 0) if existing else 0,
+        }
+        self._skills[name] = skill
+        self._save()
+        verb = "updated" if existing else "created"
+        return f"✅ Skill '{name}' {verb} and saved."
+
+    def delete_skill(self, name: str) -> bool:
+        """Delete a skill by name.
+
+        Returns:
+            True if the skill existed and was removed, False if not found.
+        """
+        if name in self._skills:
+            del self._skills[name]
+            self._save()
+            return True
+        return False
+
+    def increment_usage(self, name: str) -> None:
+        """Increment the usage counter for a skill (non-fatal if not found)."""
+        if name in self._skills:
+            self._skills[name]["used_count"] = self._skills[name].get("used_count", 0) + 1
+            self._save()
+
+    # ── Display helpers ──────────────────────────
+
+    def get_display(self) -> str:
+        """Human-readable skill list for terminal display."""
+        if not self._skills:
+            return "(no skills defined — use /skill create <name> to add one)"
+        lines: List[str] = []
+        for skill in self._skills.values():
+            tags = ", ".join(skill.get("tags", []))
+            tag_note = f"  [tags: {tags}]" if tags else ""
+            lines.append(
+                f"  • {skill['name']:<22} {skill.get('description', '')[:60]}{tag_note}"
+            )
+        return "\n".join(lines)
+
+    def get_context(self) -> str:
+        """Brief skill list for injection into the agent system prompt."""
+        if not self._skills:
+            return ""
+        parts = ["[Reusable Skills — use /skill-load <name> to activate one]"]
+        for skill in self._skills.values():
+            parts.append(f"  • {skill['name']}: {skill.get('description', '')[:80]}")
+        return "\n".join(parts)
+
+
+# ─────────────────────────────────────────────
+#  Module 6: Agent Core
 # ─────────────────────────────────────────────
 
 class AgentCore:
@@ -2118,6 +2351,7 @@ class AgentCore:
         self.copilot = CopilotModule()
         self.system = SystemCommandModule()
         self.memory = MemoryModule()
+        self.skills = SkillsModule()
         self.client_id = client_id
 
         # Tracks the active Spinner so Ctrl+C in the main loop can stop it cleanly
@@ -2338,6 +2572,68 @@ class AgentCore:
                     "  Provide valid JSON, e.g.: {\"path\": \"README.md\"}"
                 )
             return self.mcp.call_tool(mcp_name, tool_name, arguments)
+        # ── Memory management tools ─────────────────────────────────────────
+        elif cmd == "/memory-list":
+            display = self.memory.get_display()
+            return f"[Long-Term Memory]\n{display}"
+        elif cmd == "/memory-save":
+            rest = cmd_str[len("/memory-save"):].strip()
+            kv_parts = rest.split(None, 1)
+            if len(kv_parts) < 2:
+                return "[Error] Usage: /memory-save <key> <value>"
+            key, value = kv_parts[0], kv_parts[1]
+            self.memory.update_long_term({key: value})
+            preview = value[:60] + "..." if len(value) > 60 else value
+            return f"[Memory] Saved: {key} = {preview}"
+        elif cmd == "/memory-delete":
+            key = arg1.strip()
+            if not key:
+                return "[Error] Usage: /memory-delete <key>"
+            deleted = self.memory.delete_key(key)
+            if deleted:
+                return f"[Memory] Deleted entry: {key}"
+            return f"[Memory] Key not found: {key}"
+        # ── Skill tools ────────────────────────────────────────────────────
+        elif cmd == "/skill-list":
+            context = self.skills.get_context()
+            return context if context else "(no skills defined — use /skill-save to create one)"
+        elif cmd == "/skill-load":
+            name = arg1.strip()
+            if not name:
+                return "[Error] Usage: /skill-load <skill_name>"
+            skill = self.skills.get_skill(name)
+            if not skill:
+                available = ", ".join(s["name"] for s in self.skills.list_skills())
+                hint = f"  Available: {available}" if available else "  No skills defined yet."
+                return f"[Error] Skill '{name}' not found.\n{hint}"
+            self.skills.increment_usage(name)
+            return (
+                f"[Skill: {skill['name']}]\n"
+                f"Description: {skill.get('description', '')}\n\n"
+                f"{skill.get('content', '')}"
+            )
+        elif cmd == "/skill-save":
+            rest = cmd_str[len("/skill-save"):].strip()
+            save_parts = rest.split(None, 1)
+            if len(save_parts) < 2:
+                return (
+                    '[Error] Usage: /skill-save <name> {"description":"...","content":"..."}\n'
+                    '  Optional fields: "tags": ["tag1", "tag2"]'
+                )
+            skill_name = save_parts[0]
+            try:
+                skill_data = json.loads(save_parts[1])
+            except json.JSONDecodeError:
+                return (
+                    "[Error] Invalid JSON for /skill-save.  "
+                    'Expected: {"description":"...","content":"..."}'
+                )
+            description = skill_data.get("description", "")
+            content = skill_data.get("content", description)
+            tags = skill_data.get("tags", [])
+            if not isinstance(tags, list):
+                tags = []
+            return self.skills.save_skill(skill_name, description, content, tags)
         else:
             return f"[Error] Unknown tool: {cmd}"
 
@@ -2365,7 +2661,10 @@ class AgentCore:
             Final model response (natural language answer to the user).
         """
         installed_mcps = self.mcp.list_installed()
-        system_prompt = _build_agent_system_prompt(lt_context, installed_mcps, self._think_level)
+        skills_context = self.skills.get_context()
+        system_prompt = _build_agent_system_prompt(
+            lt_context, installed_mcps, self._think_level, skills_context
+        )
         messages: List[Dict[str, str]] = list(history) + [{"role": "user", "content": user_msg}]
 
         last_response = ""
@@ -2386,7 +2685,21 @@ class AgentCore:
                 )
             self._active_spinner = None
             if not response:
-                return last_response or "[Error] No response received."
+                # The API call failed (timeout or other network error after retries).
+                # Build a clear, actionable message rather than silently stopping.
+                if last_response:
+                    # The model had already started producing a plan/narrative.
+                    # Tell the user what happened so they can retry.
+                    return (
+                        f"{last_response}\n\n"
+                        "[Notice] The response was interrupted by a network/API error. "
+                        "The plan above was announced but the remaining steps could not be "
+                        "completed. Please try again — your request has not been modified."
+                    )
+                return (
+                    "[Error] The Copilot API did not respond (network timeout or connection "
+                    "error). Please check your network connection and try again."
+                )
 
             last_response = response
             tool_calls = TOOL_CALL_RE.findall(response)
@@ -2644,6 +2957,10 @@ class AgentCore:
         if cmd == "/mcp":
             return self._handle_mcp_command(arg1, arg2, raw)
 
+        # ── Skill commands ────────────────────────
+        if cmd == "/skill":
+            return self._handle_skill_command(arg1, arg2, raw)
+
         # ── Update ───────────────────────────────
         if cmd == "/update":
             return self._do_update()
@@ -2747,6 +3064,128 @@ class AgentCore:
             f"✅ Will level set to '{lvl}' "
             f"(extra_retries={WILL_EXTRA_RETRIES[lvl]}). "
             f"Setting saved."
+        )
+
+    def _handle_skill_command(self, sub: str, rest: str, raw: str) -> str:
+        """
+        Handle all /skill sub-commands.
+
+        Sub-commands:
+          /skill                    — list all defined skills
+          /skill list               — same
+          /skill show <name>        — show full skill details and content
+          /skill create <name>      — interactively create a new skill
+          /skill delete <name>      — delete a skill (prompts for confirmation)
+          /skill use <name> [task]  — use a skill in the agent chat loop
+        """
+        sub_lower = sub.lower() if sub else ""
+
+        # /skill  or  /skill list
+        if sub_lower in ("", "list"):
+            display = self.skills.get_display()
+            lines = [
+                "[Skills]",
+                display,
+                "",
+                "Commands:",
+                "  /skill create <name>      — create a new skill interactively",
+                "  /skill show <name>        — show skill details and content",
+                "  /skill delete <name>      — delete a skill",
+                "  /skill use <name> [task]  — use a skill in the agent loop",
+            ]
+            return "\n".join(lines)
+
+        # /skill show <name>
+        if sub_lower == "show":
+            name = rest.strip().split()[0] if rest.strip() else ""
+            if not name:
+                return "[Error] Usage: /skill show <name>"
+            skill = self.skills.get_skill(name)
+            if not skill:
+                return f"[Error] Skill '{name}' not found. Run /skill list to see available skills."
+            tags = ", ".join(skill.get("tags", [])) or "—"
+            lines = [
+                f"[Skill: {skill['name']}]",
+                f"  Description : {skill.get('description', '')}",
+                f"  Tags        : {tags}",
+                f"  Used        : {skill.get('used_count', 0)} time(s)",
+                f"  Created     : {skill.get('created_at', '?')}",
+                f"  Updated     : {skill.get('updated_at', '?')}",
+                "",
+                "Content:",
+                skill.get("content", "(empty)"),
+            ]
+            return "\n".join(lines)
+
+        # /skill create <name>
+        if sub_lower == "create":
+            name = rest.strip().split()[0] if rest.strip() else ""
+            if not name:
+                return "[Error] Usage: /skill create <name>"
+            if " " in name:
+                return "[Error] Skill names cannot contain spaces. Use hyphens instead (e.g. web-search)."
+            print(f"  Creating skill: '{name}'")
+            print("  Enter a brief one-line description:")
+            description = _safe_input("  > ") or ""
+            print("  Enter skill content/instructions (type EOF on a line by itself to finish):")
+            content_lines: List[str] = []
+            while True:
+                line = _safe_input()
+                if line is None or line.strip() == "EOF":
+                    break
+                content_lines.append(line)
+            content = "\n".join(content_lines)
+            print("  Enter tags (comma-separated, or press Enter to skip):")
+            tags_raw = _safe_input("  > ") or ""
+            tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw.strip() else []
+            return self.skills.save_skill(name, description, content, tags)
+
+        # /skill delete <name>
+        if sub_lower == "delete":
+            name = rest.strip().split()[0] if rest.strip() else ""
+            if not name:
+                return "[Error] Usage: /skill delete <name>"
+            if not self.skills.get_skill(name):
+                return f"[Error] Skill '{name}' not found."
+            if not _confirm(f"Delete skill '{name}'?"):
+                return "Cancelled."
+            deleted = self.skills.delete_skill(name)
+            return f"✅ Skill '{name}' deleted." if deleted else f"[Error] Could not delete skill '{name}'."
+
+        # /skill use <name> [task]
+        if sub_lower == "use":
+            use_parts = rest.strip().split(None, 1)
+            name = use_parts[0] if use_parts else ""
+            task = use_parts[1] if len(use_parts) > 1 else ""
+            if not name:
+                return "[Error] Usage: /skill use <name> [optional task description]"
+            skill = self.skills.get_skill(name)
+            if not skill:
+                return f"[Error] Skill '{name}' not found. Run /skill list to see available skills."
+            if not self.copilot.is_authenticated():
+                return "❌ Copilot authentication required. Run /auth first."
+            self.skills.increment_usage(name)
+            skill_context = (
+                f"[Applying skill: {skill['name']}]\n"
+                f"Description: {skill.get('description', '')}\n\n"
+                f"{skill.get('content', '')}"
+            )
+            user_message = f"{skill_context}\n\nTask: {task}" if task else skill_context
+            lt_context = self.memory.get_long_term_context()
+            history = self.memory.get_short_term()
+            self.memory.add_message("user", user_message)
+            try:
+                response = self._run_agent_chat(user_message, history, lt_context)
+            except Exception as exc:
+                response = f"[Error] Unexpected error during skill execution: {exc}"
+            if response:
+                self.memory.add_message("assistant", response)
+                return response
+            return "[Error] No response from Copilot."
+
+        return (
+            f"[Error] Unknown /skill sub-command: '{sub}'\n"
+            "  Run /skill for usage information."
         )
 
     def _handle_mcp_command(self, sub: str, rest: str, raw: str) -> str:
@@ -3064,16 +3503,18 @@ def _build_agent_system_prompt(
     lt_context: str = "",
     installed_mcps: Optional[Dict[str, dict]] = None,
     think_level: str = THINK_DEFAULT_LEVEL,
+    skills_context: str = "",
 ) -> str:
     """
     Build the system prompt for the agentic chat loop.
     Explicitly informs the model of its computer control capabilities, MCP tools,
-    and the tool-call format it must use to actually execute commands.
+    memory management tools, skills, and the tool-call format it must use.
 
     Args:
         lt_context:     Long-term memory context string.
         installed_mcps: Dict of installed MCP servers.
         think_level:    Current reasoning-intensity level (off/low/medium/high).
+        skills_context: Optional skill list string from SkillsModule.get_context().
     """
     parts = [
         "You are Sapiens2.0, an AI agent with DIRECT computer control capabilities.\n"
@@ -3110,6 +3551,24 @@ def _build_agent_system_prompt(
         "MCP TOOL CALL (after installation):\n"
         "  <tool>/mcp-call mcp_name tool_name {\"arg\": \"value\"}</tool>\n"
         "  — Calls a tool on an installed MCP server. The JSON arguments must be valid.\n"
+        "\n"
+        "LONG-TERM MEMORY MANAGEMENT TOOLS:\n"
+        "  <tool>/memory-list</tool>              — list all current long-term memory entries\n"
+        "  <tool>/memory-save key value</tool>    — save/update a fact to long-term memory\n"
+        "  <tool>/memory-delete key</tool>        — delete a specific fact from long-term memory\n"
+        "  Use these tools autonomously to:\n"
+        "    - Save important facts the user shares (preferences, project context, key info)\n"
+        "    - Update outdated facts when the user corrects something\n"
+        "    - Delete wrong or irrelevant facts you discover with /memory-list\n"
+        f"  Memory is bounded to {MEMORY_MAX_ENTRIES} entries; oldest are auto-pruned when full.\n"
+        "\n"
+        "SKILL TOOLS (reusable workflow shortcuts):\n"
+        "  <tool>/skill-list</tool>                    — list available skills\n"
+        "  <tool>/skill-load skill_name</tool>          — load skill instructions into context\n"
+        '  <tool>/skill-save name {"description":"...","content":"..."}</tool>\n'
+        "                                              — save a new skill for future reuse\n"
+        "  When a user's request matches a known skill, prefer loading it with /skill-load\n"
+        "  for consistent, high-quality execution.\n"
         "\n"
         "COMPUTER CONTROL EXAMPLES:\n"
         "  User: 'what files are in this folder?' → <tool>/ls</tool>\n"
@@ -3176,6 +3635,10 @@ def _build_agent_system_prompt(
                 " The browser is already open — navigate to URLs directly without creating new pages."
             )
         parts.append("\n".join(mcp_lines))
+
+    # Include available skills if any are defined
+    if skills_context:
+        parts.append(f"\n{skills_context}")
 
     if lt_context:
         parts.append(f"\n{lt_context}")
@@ -3285,6 +3748,37 @@ def _help_text() -> str:
 
           MCP state is persisted to: ~/.sapiens2/mcp_state.json
 
+        SKILLS (reusable capability workflows):
+          Skills let you define, store, and reuse common workflows so the agent
+          performs frequently needed tasks consistently and reliably.
+
+          /skill               List all defined skills
+          /skill list          Same as above
+          /skill show <name>   Show full skill details and instructions
+          /skill create <name> Interactively create a new skill (prompted)
+          /skill delete <name> Delete a skill (confirms first)
+          /skill use <name> [task]
+                               Activate a skill in the agent chat loop, optionally
+                               combined with a task description.
+                               Example: /skill use web-search find the latest Node.js LTS
+
+          The agent can also use skills autonomously during a conversation using
+          internal tool tags (/skill-list, /skill-load, /skill-save).
+          Skills are stored in: ~/.sapiens2/skills.json
+
+        MEMORY SYSTEM:
+          Short-term : Current session conversation history.
+                       Cleared on /new or exit.
+          Long-term  : ~/.sapiens2/sapiens_memory.json — persists across sessions.
+                       The agent automatically extracts and saves important facts.
+                       Auto-pruned when it exceeds {max_entries} entries (oldest removed).
+                       Cleared only on /reset.
+
+          /memory     Display all current long-term memory entries.
+
+          The agent manages long-term memory autonomously — it can save new facts,
+          update existing ones, and delete stale entries using built-in memory tools.
+
         THINKING INDICATOR:
           While Sapiens2.0 is preparing a response a spinning indicator
             [Sapiens2.0] Thinking |
@@ -3297,6 +3791,13 @@ def _help_text() -> str:
           the agent is working is queued and processed the moment the current
           response finishes.  A hint is shown at the start of each response:
             ⏳ Thinking... (you can type your next message now — it will be queued)
+
+        NETWORK / API TIMEOUT RECOVERY:
+          If the Copilot API times out or encounters a transient network error, the
+          request is automatically retried up to {max_retries} time(s) with increasing
+          back-off delay.  If all retries fail and the agent had already announced a
+          plan, the partial plan is shown along with a clear explanation so you can
+          try again without losing context.
 
         CANCEL RESPONSE (force-stop):
           Press Ctrl+C while Sapiens2.0 is generating a response to cancel it.
@@ -3322,19 +3823,15 @@ def _help_text() -> str:
           /help  or  /?        Show this help text
           /exit  or  /quit     Exit Sapiens2.0
 
-        MEMORY SYSTEM:
-          Short-term : Current session conversation history.
-                       Cleared on /new or exit.
-          Long-term  : ~/.sapiens2/sapiens_memory.json — persists across sessions.
-                       The agent automatically extracts and saves important facts.
-                       Cleared only on /reset.
-
         PERSISTENT AUTH:
           After your first /auth, your GitHub account is saved to ~/.sapiens2/config.json.
           The next time you run 'sapiens wakeup', you are automatically logged in —
           no need to re-authenticate unless you run /logout.
-    """)
-
+    """.replace(
+        "{max_entries}", str(MEMORY_MAX_ENTRIES)
+    ).replace(
+        "{max_retries}", str(CHAT_API_MAX_RETRIES)
+    ))
 
 
 # ─────────────────────────────────────────────
@@ -3586,6 +4083,14 @@ def _print_banner(agent: "AgentCore") -> None:
         print(f"  [MCP] {len(installed_mcps)} MCP server(s) ready: {names}  (/mcp to manage)")
     else:
         print("  [MCP] No MCPs installed. Type /mcp auto <goal> to discover and install one.")
+
+    skills = agent.skills.list_skills()
+    if skills:
+        skill_names = ", ".join(s["name"] for s in skills[:5])
+        suffix = f"  +{len(skills) - 5} more" if len(skills) > 5 else ""
+        print(f"  [SK] {len(skills)} skill(s) defined: {skill_names}{suffix}  (/skill to manage)")
+    else:
+        print("  [SK] No skills defined. Type /skill create <name> to add one.")
 
     print(f"  [>]  Model: {agent.copilot.get_model()}  (/models to change)")
     print(f"  [T]  Think level: {agent._think_level}  (/think to change)")
