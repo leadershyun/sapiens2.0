@@ -3,7 +3,7 @@ Sapiens2.0 - AI Agent
 ======================
 An AI agent prototype with computer control, long-term memory, GitHub Copilot integration,
 automatic MCP (Model Context Protocol) discovery/installation/usage, a thinking indicator,
-Ctrl+C force-cancel support, and a Discord bot mode.
+Ctrl+C force-cancel support, queued-input-while-working, and a Discord bot mode.
 
 Features:
   1. Conversational AI powered by GitHub Copilot
@@ -16,6 +16,8 @@ Features:
   7. Thinking indicator: an ASCII spinner shows while Sapiens2.0 is preparing a response.
   8. Force-cancel: press Ctrl+C during response generation to stop it cleanly.
   9. Discord bot mode: run as a Discord bot with `sapiens wakeup --discord`.
+ 10. Queued input: type your next question while the agent is still responding — it is
+     queued automatically and processed as soon as the current response finishes.
 
 Installation & Usage:
   pip install -e .         # Install once — makes 'sapiens' command available globally
@@ -40,6 +42,11 @@ Thinking indicator:
 Cancel a response:
   Press Ctrl+C while the response is being generated to cancel it.
   The app recovers cleanly and shows the next prompt immediately.
+
+Queued input (responding while the agent works):
+  You can type your next message at any time — even while the agent is generating a
+  response.  The input is queued and processed immediately after the current response
+  finishes.  A tip is shown at the start of each response so you know it is safe to type.
 
 Discord bot mode:
   pip install "discord.py>=2.0.0"
@@ -104,6 +111,7 @@ import asyncio
 import base64
 import itertools
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -253,6 +261,11 @@ SAPIENS_VERSION = "2.0"
 # Maximum lines to read from MCP server stdout when waiting for a JSON-RPC response
 MCP_MAX_RESPONSE_LINES = 50
 
+# Seconds to wait for a single line of output from the MCP server process.
+# A per-line timeout prevents the agent from hanging indefinitely when an MCP
+# server starts but never responds to the JSON-RPC initialize request.
+MCP_READLINE_TIMEOUT_SECONDS = 15
+
 # Regex for extracting npm package names from README install instructions
 NPM_PACKAGE_RE = re.compile(r"npm install.*?([\w@][\w/.-]+)")
 
@@ -399,6 +412,74 @@ def _find_node_cmd(name: str) -> str:
     # Fall back to the plain name — subprocess will raise FileNotFoundError if
     # Node.js really is not installed, and callers handle that explicitly.
     return name
+
+
+# ─────────────────────────────────────────────
+#  Stdin reader — queued input while working
+# ─────────────────────────────────────────────
+
+# Module-level queue populated by the background stdin reader thread.
+# None until _start_stdin_reader() is called (i.e. in CLI mode only).
+_stdin_queue: "Optional[queue.Queue[Optional[str]]]" = None
+
+
+def _start_stdin_reader() -> "queue.Queue[Optional[str]]":
+    """
+    Start a daemon thread that continuously reads lines from stdin and puts
+    them in a queue.  This allows user input to be captured even while the
+    main thread is busy processing a previous request, enabling queued input.
+
+    Returns the queue so the caller can read from it.
+    """
+    global _stdin_queue
+    q: "queue.Queue[Optional[str]]" = queue.Queue()
+    _stdin_queue = q
+
+    def _reader() -> None:
+        while True:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    q.put(None)  # EOF
+                    break
+                q.put(line.rstrip("\r\n"))
+            except (EOFError, OSError, KeyboardInterrupt):
+                q.put(None)
+                break
+
+    t = threading.Thread(target=_reader, daemon=True, name="stdin-reader")
+    t.start()
+    return q
+
+
+def _safe_input(prompt: str = "") -> Optional[str]:
+    """
+    Read one line of user input.
+
+    When the background stdin reader thread is active (CLI mode), this reads
+    from the shared queue — which means input typed while the agent was working
+    is returned immediately (queued input).
+
+    Falls back to the built-in ``input()`` when called outside CLI mode
+    (e.g. from tests or Discord mode).
+
+    Args:
+        prompt: Text to print before reading input (written to stdout, not
+                passed to input() so it works correctly in both modes).
+
+    Returns:
+        The input line (without trailing newline), or None on EOF.
+    """
+    if prompt:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+    if _stdin_queue is not None:
+        return _stdin_queue.get()
+    # Fallback for non-CLI contexts
+    try:
+        return input()
+    except EOFError:
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -1215,6 +1296,9 @@ class MCPRunner:
         self._process: Optional[subprocess.Popen] = None
         self._msg_id = 0
         self._tools: List[Dict] = []
+        # Background thread that drains stdout into a queue so reads can time out.
+        self._stdout_queue: "queue.Queue[Optional[bytes]]" = queue.Queue()
+        self._stdout_reader: Optional[threading.Thread] = None
 
     # ── Internal helpers ────────────────────────
 
@@ -1222,10 +1306,52 @@ class MCPRunner:
         self._msg_id += 1
         return self._msg_id
 
+    def _start_stdout_reader(self) -> None:
+        """
+        Launch a daemon thread that continuously reads stdout from the MCP
+        server process and enqueues each line.  This decouples the read from
+        the send so that _read_line() can impose a wall-clock timeout without
+        blocking the whole process forever.
+        """
+        def _drain() -> None:
+            assert self._process is not None
+            try:
+                while True:
+                    line = self._process.stdout.readline()
+                    self._stdout_queue.put(line if line else None)
+                    if not line:
+                        break
+            except (OSError, ValueError):
+                self._stdout_queue.put(None)
+
+        self._stdout_reader = threading.Thread(target=_drain, daemon=True, name="mcp-stdout-drain")
+        self._stdout_reader.start()
+
+    def _read_line(self, timeout: float = MCP_READLINE_TIMEOUT_SECONDS) -> Optional[bytes]:
+        """
+        Return the next stdout line from the MCP process, or None on timeout / EOF.
+
+        Because the actual I/O happens in the background drain thread, this call
+        never blocks forever — it returns None after *timeout* seconds even if
+        the server never responds.
+
+        Args:
+            timeout: Maximum seconds to wait for the next line.  Must be a
+                     positive float.  Values <=0 are treated as an immediate
+                     non-blocking check (returns None if no line is queued).
+        """
+        try:
+            item = self._stdout_queue.get(timeout=timeout)
+            return item  # may be None on EOF
+        except queue.Empty:
+            return None  # timeout
+
     def _send(self, method: str, params: Optional[dict] = None) -> Optional[dict]:
         """
         Send a JSON-RPC 2.0 request to the MCP server and return the response.
-        Reads up to MCP_MAX_RESPONSE_LINES lines of stdout looking for the matching response ID.
+        Reads up to MCP_MAX_RESPONSE_LINES lines of stdout looking for the matching
+        response ID.  Each readline attempt times out after MCP_READLINE_TIMEOUT_SECONDS
+        so the call cannot block indefinitely.
         """
         if not self._process:
             return None
@@ -1238,7 +1364,7 @@ class MCPRunner:
             self._process.stdin.write(line.encode("utf-8"))
             self._process.stdin.flush()
             for _ in range(MCP_MAX_RESPONSE_LINES):
-                raw = self._process.stdout.readline()
+                raw = self._read_line()
                 if not raw:
                     break
                 try:
@@ -1300,6 +1426,10 @@ class MCPRunner:
             )
         except OSError as exc:
             return False, f"Failed to start MCP server: {exc}"
+
+        # Start the background stdout reader so _send() can use timed reads
+        # instead of blocking forever on readline().
+        self._start_stdout_reader()
 
         # MCP initialize handshake
         init_resp = self._send("initialize", {
@@ -1364,7 +1494,7 @@ class MCPRunner:
         return "\n".join(parts) if parts else "(no output)"
 
     def stop(self) -> None:
-        """Terminate the MCP server process."""
+        """Terminate the MCP server process and stop the stdout reader thread."""
         if self._process:
             try:
                 self._process.terminate()
@@ -1375,6 +1505,12 @@ class MCPRunner:
                 except OSError:
                     pass
             self._process = None
+        # Sentinel is pushed AFTER _process is set to None so that any caller
+        # that picks it up and checks self._process will see the cleared state.
+        # The stdout reader daemon exits on its own once the pipe closes, but
+        # the sentinel ensures a blocked _read_line() returns immediately without
+        # waiting for the full MCP_READLINE_TIMEOUT_SECONDS to expire.
+        self._stdout_queue.put(None)
 
 
 # ─────────────────────────────────────────────
@@ -1982,6 +2118,29 @@ class AgentCore:
             if not goal:
                 return "[Error] Usage: /mcp-auto <goal description>"
             return self._do_mcp_auto(goal)
+        elif cmd == "/mcp-tools":
+            # List tools available in an installed MCP server.
+            # This is the in-loop equivalent of the user-facing /mcp tools command
+            # so the model can discover capabilities without exiting the agent loop.
+            name = arg1.strip()
+            if not name:
+                return "[Error] Usage: /mcp-tools <mcp_name>"
+            if not self.mcp.is_installed(name):
+                return (
+                    f"[MCP Error] '{name}' is not installed. "
+                    f"Use <tool>/mcp-auto {name}</tool> to discover and install it first."
+                )
+            tools = self.mcp.get_available_tools(name)
+            if not tools:
+                return (
+                    f"[MCP] No tools found for '{name}' "
+                    "(server may have failed to start — check Node.js is installed)."
+                )
+            lines = [f"Tools available in '{name}':"]
+            for t in tools:
+                desc = t.get("description", "")
+                lines.append(f"  • {t.get('name', '?')}: {desc[:80]}")
+            return "\n".join(lines)
         elif cmd == "/mcp-call":
             # Call a tool on an installed MCP: /mcp-call <mcp_name> <tool_name> [json_args]
             rest = cmd_str[len("/mcp-call"):].strip()
@@ -2199,14 +2358,11 @@ class AgentCore:
             if not content:
                 print(f"  Enter content for '{arg1}' (type EOF on its own line to finish):")
                 lines = []
-                try:
-                    while True:
-                        line = input()
-                        if line == "EOF":
-                            break
-                        lines.append(line)
-                except EOFError:
-                    pass
+                while True:
+                    line = _safe_input()
+                    if line is None or line == "EOF":
+                        break
+                    lines.append(line)
                 content = "\n".join(lines)
             return self.system.write_file(arg1, content)
 
@@ -2571,13 +2727,18 @@ def _confirm(message: str) -> bool:
     """
     Ask the user for a yes/no confirmation.
 
+    Uses _safe_input() so it works correctly whether or not the background
+    stdin reader thread is active.
+
     Returns:
         True if the user confirms (y/yes), False otherwise.
     """
     try:
-        answer = input(f"{message} [y/N] ").strip().lower()
-        return answer in ("y", "yes")
-    except (EOFError, KeyboardInterrupt):
+        answer = _safe_input(f"{message} [y/N] ")
+        if answer is None:
+            return False
+        return answer.strip().lower() in ("y", "yes")
+    except KeyboardInterrupt:
         return False
 
 
@@ -2663,6 +2824,11 @@ def _build_agent_system_prompt(
         "    reports what tools are now available. Use this when you need external\n"
         "    capabilities (web search, browser, database, etc.) not yet installed.\n"
         "\n"
+        "MCP TOOL LIST (after installation):\n"
+        "  <tool>/mcp-tools mcp_name</tool>\n"
+        "  — List the tools available in an installed MCP server.\n"
+        "    Use this right after installation to see what tools you can call.\n"
+        "\n"
         "MCP TOOL CALL (after installation):\n"
         "  <tool>/mcp-call mcp_name tool_name {\"arg\": \"value\"}</tool>\n"
         "  — Calls a tool on an installed MCP server. The JSON arguments must be valid.\n"
@@ -2683,7 +2849,11 @@ def _build_agent_system_prompt(
         "5. After seeing tool results, give a concise natural language summary.\n"
         "6. Answer in the same language the user writes in.\n"
         "7. If the user needs external capabilities (web search, database access, browser\n"
-        "   automation, etc.) and no MCP is installed, use /mcp-auto to install one.",
+        "   automation, etc.) and no MCP is installed, use /mcp-auto to install one.\n"
+        "8. NEVER run interactive, long-running, or non-terminating commands with /exec\n"
+        "   (e.g. npx @modelcontextprotocol/inspector, server start scripts, watch modes,\n"
+        "   interactive REPLs).  Such commands block indefinitely and freeze the agent.\n"
+        "   Use /mcp-auto and /mcp-call instead of running MCP servers directly.",
     ]
 
     # Append think-level instruction when it carries a non-empty suffix
@@ -2701,7 +2871,7 @@ def _build_agent_system_prompt(
             "\nTo call an MCP tool: <tool>/mcp-call mcp_name tool_name {\"arg\": \"value\"}</tool>"
         )
         mcp_lines.append(
-            "To discover tools in an MCP, first run: /mcp tools <mcp_name>"
+            "To list tools in an MCP: <tool>/mcp-tools mcp_name</tool>"
         )
         parts.append("\n".join(mcp_lines))
 
@@ -2806,6 +2976,13 @@ def _help_text() -> str:
             [Sapiens2.0] Thinking |
           is shown on one line.  It stops and the line is cleared the moment
           the response starts printing, so it never interferes with output.
+
+        QUEUED INPUT (type while the agent is responding):
+          You do NOT need to wait for a response before typing your next message.
+          A background thread reads stdin continuously, so any text you type while
+          the agent is working is queued and processed the moment the current
+          response finishes.  A hint is shown at the start of each response:
+            ⏳ Thinking... (you can type your next message now — it will be queued)
 
         CANCEL RESPONSE (force-stop):
           Press Ctrl+C while Sapiens2.0 is generating a response to cancel it.
@@ -3099,7 +3276,8 @@ def _print_banner(agent: "AgentCore") -> None:
     print(f"  [T]  Think level: {agent._think_level}  (/think to change)")
     print()
     print("  Type /help to see all commands. Type your message to start chatting.")
-    print("  Tip: Press Ctrl+C while Sapiens2.0 is thinking to cancel the response.")
+    print("  Tip: Press Ctrl+C to cancel a response. Type your next message at any time")
+    print("       while the agent is thinking -- it will be queued automatically.")
     print()
 
 
@@ -3174,12 +3352,20 @@ def main() -> None:
     # ── Interactive terminal mode ────────────────────────────────────────────
     _print_banner(agent)
 
+    # Start the background stdin reader thread.  From this point on ALL stdin
+    # reads must go through _safe_input() / _stdin_queue so they are serialised
+    # through the single reader thread.  This enables queued input: if the user
+    # types a message while the agent is still working, it lands in the queue
+    # and is processed as soon as the current response finishes.
+    _start_stdin_reader()
+
     while True:
-        try:
-            user_input = input("[You] ").strip()
-        except (EOFError, KeyboardInterrupt):
+        user_input_raw = _safe_input("[You] ")
+        if user_input_raw is None:
+            # EOF — stdin was closed (e.g. piped input exhausted)
             print("\nGoodbye!")
             break
+        user_input = user_input_raw.strip()
 
         if not user_input:
             continue
@@ -3195,6 +3381,11 @@ def main() -> None:
         # ── Chat messages run in a background thread so Ctrl+C can cancel ──
         # The spinner is managed inside _run_agent_chat via agent._active_spinner
         # so it can be stopped cleanly from the Ctrl+C handler below.
+        #
+        # Because the stdin reader thread keeps reading from stdin while the
+        # worker is busy, anything the user types now goes straight into
+        # _stdin_queue and will be processed on the NEXT loop iteration —
+        # providing transparent queued input without any extra complexity.
         result_box: List[Optional[str]] = [None]
         done_event = threading.Event()
 
@@ -3204,6 +3395,13 @@ def main() -> None:
 
         worker = threading.Thread(target=_work, daemon=True)
         worker.start()
+
+        print(
+            "  [Thinking...] "
+            "(you can type your next message now -- it will be queued)\n",
+            end="",
+            flush=True,
+        )
 
         try:
             done_event.wait()
