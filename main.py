@@ -102,7 +102,10 @@ MCP auto-discovery:
   The agent automatically discovers, installs, and uses MCP servers when needed.
   - It searches GitHub for MCP repos, reads their README/description, and uses
     Copilot to pick the best match for the user's goal.
-  - A curated baseline registry of well-known MCPs is always available.
+  - A curated baseline registry of well-known MCPs is always available, including
+    puppeteer and playwright for browser automation.
+  - Browser MCPs (puppeteer, playwright) reuse a persistent session between tool
+    calls so the browser window is not recreated on every request.
   - All installation steps are logged transparently (repo URL, package name, command).
   - Installed MCPs are persisted to ~/.sapiens2/mcp_state.json across sessions.
   - The agent can call MCP tools automatically using <tool>/mcp-call ...</tool> tags.
@@ -302,6 +305,19 @@ GITHUB_README_MAX_CHARS = 2000
 # Stop words excluded from MCP keyword scoring (common English words with no discriminating value)
 _MCP_SCORE_STOP_WORDS = {"", "a", "an", "the", "to", "for", "in", "of", "and", "or", "is", "on"}
 
+# Patterns that match npx invocations of known MCP packages (which start persistent server
+# processes and hang when run with /exec — the agent must use /mcp-auto or /mcp-call instead).
+# Split into readable named sub-patterns, then combined with OR.
+_MCP_EXEC_BLOCK_PATTERNS = [
+    r"npx\b.*?@modelcontextprotocol/",   # any @modelcontextprotocol/* package
+    r"npx\b.*?@playwright/mcp",           # @playwright/mcp specifically
+    r"npx\b.*?@[\w.-]+/(?:mcp[-.]|server-)",  # scoped packages matching mcp-* or server-*
+]
+_MCP_EXEC_BLOCK_RE = re.compile(
+    "|".join(_MCP_EXEC_BLOCK_PATTERNS),
+    re.IGNORECASE,
+)
+
 # Curated baseline registry of well-known, safe MCP servers.
 # Each entry is fully self-describing so the agent can install and run without
 # any additional lookup.  Extended at runtime by GitHub discovery.
@@ -366,6 +382,23 @@ MCP_CURATED_REGISTRY: List[Dict] = [
             "puppeteer", "navigate", "click",
         ],
         "repo": "modelcontextprotocol/servers",
+        "persistent": True,  # keeps the browser alive across tool calls
+    },
+    {
+        "name": "playwright",
+        "package": "@playwright/mcp",
+        "install_type": "npm",
+        "run_cmd": ["npx", "-y", "@playwright/mcp@latest"],
+        "description": (
+            "Playwright browser automation: control a visible browser window, navigate pages, "
+            "click, type, take screenshots. Supports Chrome, Firefox, Safari."
+        ),
+        "tags": [
+            "browser", "playwright", "automation", "web", "scraping", "screenshot",
+            "navigate", "click", "visible", "headful", "chromium", "firefox",
+        ],
+        "repo": "microsoft/playwright-mcp",
+        "persistent": True,  # keeps the browser alive across tool calls
     },
     {
         "name": "fetch",
@@ -1294,6 +1327,20 @@ class SystemCommandModule:
             if not _confirm(f"⚠️  '{command}' may be dangerous. Run anyway?"):
                 return "Cancelled."
 
+        # Guard: MCP server packages (npx @.../mcp-... or npx @playwright/mcp etc.) are
+        # persistent stdio processes that wait for JSON-RPC input forever — running them
+        # with /exec would block the agent until the 30-second timeout fires.
+        # Intercept early and redirect the model to the correct MCP tools instead.
+        if _MCP_EXEC_BLOCK_RE.search(command):
+            return (
+                "[Error] This command looks like an MCP server package invocation "
+                f"({command!r}).\n"
+                "MCP packages start persistent server processes that wait on stdin — "
+                "running them with /exec blocks the agent and achieves nothing.\n"
+                "Use /mcp-auto or /mcp install to install an MCP, then /mcp-call to "
+                "use its tools.  Do NOT use /exec or npx to run MCP servers directly."
+            )
+
         return _run_subprocess(command, shell=True, cwd=self._cwd)
 
 
@@ -1568,7 +1615,39 @@ class MCPModule:
     def __init__(self, copilot: "CopilotModule"):
         self._copilot = copilot
         self._installed: Dict[str, dict] = {}
+        # Persistent MCPRunner cache for browser/long-lived servers.
+        # Keys are MCP names; values are active MCPRunner instances that are
+        # kept alive across multiple tool calls so the browser window (or other
+        # stateful resource) is not recreated for every single request.
+        self._persistent_runners: Dict[str, "MCPRunner"] = {}
         self._load_state()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup when the module is garbage-collected.
+
+        Note: ``__del__`` is not guaranteed to be called promptly (or at all in
+        some Python implementations).  Prefer calling ``shutdown()`` explicitly
+        when the agent session ends.
+        """
+        self._stop_all_persistent_runners()
+
+    def shutdown(self) -> None:
+        """Explicitly stop all persistent MCP runner sessions.
+
+        Call this when the agent is shutting down to ensure browser processes
+        and other long-lived MCP servers are terminated cleanly.
+        """
+        self._stop_all_persistent_runners()
+
+    def _stop_all_persistent_runners(self) -> None:
+        """Terminate every cached persistent MCP runner."""
+        for name, runner in list(self._persistent_runners.items()):
+            try:
+                runner.stop()
+            except Exception as exc:
+                # Log but do not propagate — cleanup must be best-effort.
+                print(f"[MCP] Warning: failed to stop persistent runner '{name}': {exc}")
+        self._persistent_runners.clear()
 
     # ── State persistence ────────────────────────
 
@@ -1922,10 +2001,16 @@ class MCPModule:
 
     def call_tool(self, mcp_name: str, tool_name: str, arguments: dict) -> str:
         """
-        Start the named MCP server, call *tool_name* with *arguments*, return the result.
+        Call *tool_name* on the named MCP server with *arguments* and return the result.
 
-        The server is started fresh for each call and shut down immediately after.
-        This keeps the implementation simple at the cost of some startup overhead.
+        For MCPs tagged ``"persistent": True`` (browser MCPs such as puppeteer and
+        playwright) the server process is kept alive between calls so the browser
+        window is reused rather than respawned every time.  This avoids the repeated
+        ``about:blank`` windows that appear when the browser is started from scratch
+        for each tool invocation.
+
+        For all other MCPs the server is started fresh for each call and shut down
+        immediately after (original behaviour).
 
         Returns:
             Tool result as a string, or an error message.
@@ -1952,6 +2037,12 @@ class MCPModule:
         if self._copilot._github_token:
             env.setdefault("GITHUB_PERSONAL_ACCESS_TOKEN", self._copilot._github_token)
 
+        is_persistent = bool(info.get("persistent", False))
+
+        if is_persistent:
+            return self._call_tool_persistent(mcp_name, tool_name, arguments, run_cmd, env)
+
+        # Non-persistent: start fresh, call, stop
         runner = MCPRunner(run_cmd, env=env)
         ok, err_msg = runner.start()
         if not ok:
@@ -1960,6 +2051,49 @@ class MCPModule:
             return runner.call_tool(tool_name, arguments)
         finally:
             runner.stop()
+
+    def _call_tool_persistent(
+        self,
+        mcp_name: str,
+        tool_name: str,
+        arguments: dict,
+        run_cmd: List[str],
+        env: Dict[str, str],
+    ) -> str:
+        """
+        Call a tool on a persistent MCP server, reusing an already-running instance
+        when one exists.  If the server is not yet running, or if it appears to have
+        died, it is (re)started transparently.
+
+        This is the implementation path for browser MCPs (puppeteer, playwright) so
+        that the browser window stays open across multiple tool calls instead of being
+        recreated — and creating a new ``about:blank`` page — every time.
+        """
+        runner = self._persistent_runners.get(mcp_name)
+
+        # If we have a cached runner, verify it is still alive
+        if runner is not None:
+            proc = getattr(runner, "_process", None)
+            if proc is None or proc.poll() is not None:
+                # Process has exited — discard and restart
+                try:
+                    runner.stop()
+                except Exception:
+                    pass
+                del self._persistent_runners[mcp_name]
+                runner = None
+
+        if runner is None:
+            # Start and cache a new persistent runner
+            print(f"[MCP] Starting persistent session for '{mcp_name}'...")
+            runner = MCPRunner(run_cmd, env=env)
+            ok, err_msg = runner.start()
+            if not ok:
+                return f"[MCP Error] Could not start '{mcp_name}': {err_msg}"
+            self._persistent_runners[mcp_name] = runner
+            print(f"[MCP] '{mcp_name}' browser session is ready.")
+
+        return runner.call_tool(tool_name, arguments)
 
 
 # ─────────────────────────────────────────────
@@ -2271,7 +2405,7 @@ class AgentCore:
             turn_has_error = False
             for tool_cmd in tool_calls:
                 tool_cmd = tool_cmd.strip()
-                print(f"  ⚙  {tool_cmd}")
+                print(f"  ⚙  {tool_cmd}", flush=True)
                 result = self._execute_agent_tool(tool_cmd)
                 # Print result with indentation for readability
                 for line in result.splitlines():
@@ -2517,6 +2651,7 @@ class AgentCore:
         # ── Exit ─────────────────────────────────
         if cmd in ("/exit", "/quit", "/q"):
             print("Goodbye! 👋")
+            self.mcp.shutdown()
             sys.exit(0)
 
         return f"[Error] Unknown command: {cmd}\nType /help to see all available commands."
@@ -2996,7 +3131,24 @@ def _build_agent_system_prompt(
         "8. NEVER run interactive, long-running, or non-terminating commands with /exec\n"
         "   (e.g. npx @modelcontextprotocol/inspector, server start scripts, watch modes,\n"
         "   interactive REPLs).  Such commands block indefinitely and freeze the agent.\n"
-        "   Use /mcp-auto and /mcp-call instead of running MCP servers directly.",
+        "   Use /mcp-auto and /mcp-call instead of running MCP servers directly.\n"
+        "9. NEVER use /exec to check the version or existence of an MCP package\n"
+        "   (e.g. 'npx @playwright/mcp@latest --version' or 'npm list -g @playwright/mcp').\n"
+        "   MCP packages are persistent server processes — running them with /exec hangs\n"
+        "   the agent because they wait for stdin forever.  To check if an MCP is available,\n"
+        "   use /mcp-auto or /mcp install <name>; never use /exec for MCP executables.\n"
+        "\n"
+        "BROWSER AUTOMATION RULES (puppeteer / playwright MCP):\n"
+        "A. A browser session is kept alive between tool calls — do NOT open a new browser\n"
+        "   or create a new page on every call.  The browser is already open after the first\n"
+        "   /mcp-call; subsequent calls reuse the same window.\n"
+        "B. To navigate: call the 'navigate' (or 'browser_navigate') tool with the target\n"
+        "   URL directly.  Do not open a blank page first and then navigate separately.\n"
+        "C. Do NOT call 'browser_new_page', 'newPage', or any 'create new tab' tool unless\n"
+        "   the user explicitly asks for a new tab.  Reuse the existing page.\n"
+        "D. If a tool call returns an about:blank error or no-URL error, call the navigate\n"
+        "   tool immediately with the correct URL instead of opening another blank page.\n"
+        "E. Prefer a linear workflow: navigate → interact → screenshot → report result.",
     ]
 
     # Append think-level instruction when it carries a non-empty suffix
@@ -3006,16 +3158,23 @@ def _build_agent_system_prompt(
 
     # Include installed MCP info if any servers are available
     if installed_mcps:
+        persistent_mcps = {n for n, info in installed_mcps.items() if info.get("persistent")}
         mcp_lines = ["\nINSTALLED MCP SERVERS (external tool capabilities):"]
         for mcp_name, info in installed_mcps.items():
             desc = info.get("description", "")
-            mcp_lines.append(f"  • {mcp_name}: {desc[:80]}")
+            session_note = " [PERSISTENT BROWSER SESSION — reuse existing page, do not create new tabs]" if mcp_name in persistent_mcps else ""
+            mcp_lines.append(f"  • {mcp_name}: {desc[:80]}{session_note}")
         mcp_lines.append(
             "\nTo call an MCP tool: <tool>/mcp-call mcp_name tool_name {\"arg\": \"value\"}</tool>"
         )
         mcp_lines.append(
             "To list tools in an MCP: <tool>/mcp-tools mcp_name</tool>"
         )
+        if persistent_mcps:
+            mcp_lines.append(
+                f"\nIMPORTANT: {', '.join(sorted(persistent_mcps))} use a persistent browser session."
+                " The browser is already open — navigate to URLs directly without creating new pages."
+            )
         parts.append("\n".join(mcp_lines))
 
     if lt_context:
@@ -3520,6 +3679,7 @@ def main() -> None:
         if user_input_raw is None:
             # EOF — stdin was closed (e.g. piped input exhausted)
             print("\nGoodbye!")
+            agent.mcp.shutdown()
             break
         user_input = user_input_raw.strip()
 
