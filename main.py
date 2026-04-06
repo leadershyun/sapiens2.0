@@ -633,15 +633,15 @@ def _run_bootstrap(
                     None,
                 )
                 if not entry:
-                    lines.append(f"    [!] '{_mcp_name}' not found in registry — skipping.")
+                    lines.append(f"    [!] '{_mcp_name}' not found in registry -- skipping.")
                     continue
-                print(f"  [Setup] Installing '{_mcp_name}'...", flush=True)
+                print(f"  [*] Installing '{_mcp_name}'...", flush=True)
                 ok, msg = mcp_module.install(entry)
                 if ok:
                     lines.append(f"    '{_mcp_name}' ........... OK")
                 else:
                     short_msg = msg.split("\n")[0][:80]
-                    lines.append(f"    '{_mcp_name}' ........... FAILED — {short_msg}")
+                    lines.append(f"    '{_mcp_name}' ........... FAILED -- {short_msg}")
             lines.append("")
     elif to_install:
         lines.append("  Tip: run /setup to auto-install missing essentials.")
@@ -4503,7 +4503,7 @@ def cli_entry() -> None:
     if subcommand == "setup":
         # Run the bootstrap health-check + auto-install standalone (no full
         # agent start needed — works before /auth is performed).
-        print("[Sapiens2.0] Starting environment setup...")
+        print("[Setup] Starting environment setup...")
         report = _run_bootstrap(mcp_module=None, auto_install=True)
         print(report)
         return
