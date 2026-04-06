@@ -3,7 +3,8 @@ Sapiens2.0 - AI Agent
 ======================
 An AI agent prototype with computer control, long-term memory, GitHub Copilot integration,
 automatic MCP (Model Context Protocol) discovery/installation/usage, a thinking indicator,
-Ctrl+C force-cancel support, queued-input-while-working, and a Discord bot mode.
+Ctrl+C force-cancel support, queued-input-while-working, a Discord bot mode, and
+configurable goal-seeking retry behaviour via /will.
 
 Features:
   1. Conversational AI powered by GitHub Copilot
@@ -18,6 +19,10 @@ Features:
   9. Discord bot mode: run as a Discord bot with `sapiens wakeup --discord`.
  10. Queued input: type your next question while the agent is still responding — it is
      queued automatically and processed as soon as the current response finishes.
+ 11. Resilient error handling: subprocess and tool failures never crash the session;
+     they are surfaced as structured error strings the model can analyze.
+ 12. /will command: configure how persistently the agent retries after a failure
+     (off / low / medium / high / max).  Setting persists across restarts.
 
 Installation & Usage:
   pip install -e .         # Install once — makes 'sapiens' command available globally
@@ -60,6 +65,7 @@ Key Commands:
   /logout               Unlink the saved GitHub account
   /models [num|name]    List or select available Copilot models
   /think [level]        View or set reasoning intensity: off / low / medium / high
+  /will [level]         View or set retry/persistence intensity: off / low / medium / high / max
   /new                  Start a new conversation (short-term memory cleared)
   /reset                Full reset: long-term memory + model settings cleared
   /update               Update Sapiens2.0 to the latest code automatically
@@ -236,6 +242,24 @@ THINK_PROMPT_SUFFIX: Dict[str, str] = {
         "Break down complex problems step-by-step, consider edge cases, "
         "and provide a well-reasoned, detailed response."
     ),
+}
+
+# ── /will setting ────────────────────────────────────────────────────────────
+# Controls how persistently the agent retries after a failure before giving up.
+# "off"    — no extra retries; fail immediately on first error.
+# "low"    — 1 additional goal-seeking retry after a failure.
+# "medium" — 2 additional retries (default).
+# "high"   — 3 additional retries; agent analyzes errors and tries alternatives.
+# "max"    — 5 additional retries; maximum persistence.
+WILL_LEVELS: List[str] = ["off", "low", "medium", "high", "max"]
+WILL_DEFAULT_LEVEL: str = "medium"
+# Extra tool-call iterations allowed (on top of the base 5) when failures occur.
+WILL_EXTRA_RETRIES: Dict[str, int] = {
+    "off":    0,
+    "low":    1,
+    "medium": 2,
+    "high":   3,
+    "max":    5,
 }
 
 # ─────────────────────────────────────────────
@@ -1968,6 +1992,9 @@ class AgentCore:
         # Reasoning-intensity level (off/low/medium/high). Loaded from state file.
         self._think_level: str = THINK_DEFAULT_LEVEL
 
+        # Persistence/retry intensity level (off/low/medium/high/max). Loaded from state file.
+        self._will_level: str = WILL_DEFAULT_LEVEL
+
         # Load saved state (model selection, think level, etc.)
         self._load_state()
 
@@ -1996,6 +2023,9 @@ class AgentCore:
                     think = state.get("think_level", THINK_DEFAULT_LEVEL)
                     if think in THINK_LEVELS:
                         self._think_level = think
+                    will = state.get("will_level", WILL_DEFAULT_LEVEL)
+                    if will in WILL_LEVELS:
+                        self._will_level = will
             except (json.JSONDecodeError, IOError):
                 pass
 
@@ -2006,6 +2036,7 @@ class AgentCore:
             state = {
                 "model": self.copilot.get_model(),
                 "think_level": self._think_level,
+                "will_level": self._will_level,
             }
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -2052,7 +2083,13 @@ class AgentCore:
         # Add user message to short-term memory before calling the agent
         self.memory.add_message("user", raw)
 
-        response = self._run_agent_chat(raw, history, lt_context)
+        try:
+            response = self._run_agent_chat(raw, history, lt_context)
+        except Exception as exc:
+            # Catch-all so that an unexpected exception inside the agent loop never
+            # crashes the interactive session or leaves it appearing hung.
+            response = f"[Error] An unexpected error occurred during response generation: {exc}"
+
         if response:
             self.memory.add_message("assistant", response)
             self._try_update_long_term_memory(raw, response)
@@ -2080,8 +2117,17 @@ class AgentCore:
             cmd_str: Full slash command string (e.g. '/ls .', '/cat README.md').
 
         Returns:
-            Tool execution result as a string.
+            Tool execution result as a string.  Never raises — unexpected exceptions
+            are caught and returned as a structured ``[Error]`` string so the calling
+            agent loop can report them to the model and (if will_level permits) retry.
         """
+        try:
+            return self._execute_agent_tool_inner(cmd_str)
+        except Exception as exc:
+            return f"[Error] Tool execution raised an unexpected exception: {exc}"
+
+    def _execute_agent_tool_inner(self, cmd_str: str) -> str:
+        """Internal implementation of tool dispatch (may raise)."""
         cmd_str = cmd_str.strip()
         parts = cmd_str.split(None, 2)
         if not parts:
@@ -2166,7 +2212,12 @@ class AgentCore:
         Agentic chat loop: the model can issue computer control and MCP tool calls in its
         response using <tool>/command args</tool> tags. Tool results are fed back
         to the model, and the loop continues until the model gives a final answer
-        with no more tool calls (up to 5 iterations).
+        with no more tool calls.
+
+        The maximum number of tool-call iterations is 5 (base) plus any extra
+        retries allowed by the current ``will_level`` setting.  When failures are
+        detected in tool results the model is given an explicit goal-seeking hint
+        so it tries alternative approaches rather than giving up.
 
         Intermediate tool execution output is printed inline so the user can follow
         along in real time. Only the final natural language answer is returned.
@@ -2186,7 +2237,12 @@ class AgentCore:
         last_response = ""
         max_tokens = THINK_MAX_TOKENS.get(self._think_level, THINK_MAX_TOKENS[THINK_DEFAULT_LEVEL])
 
-        for _turn in range(5):  # max 5 tool-call iterations per turn
+        # Base iterations + extra allowed by will_level
+        extra_retries = WILL_EXTRA_RETRIES.get(self._will_level, WILL_EXTRA_RETRIES[WILL_DEFAULT_LEVEL])
+        max_turns = 5 + extra_retries
+        failure_count = 0  # track consecutive tool-result failures for retry hint
+
+        for _turn in range(max_turns):
             # Show spinner while waiting for the Copilot API response
             spinner = Spinner()
             self._active_spinner = spinner
@@ -2212,6 +2268,7 @@ class AgentCore:
 
             # Execute each tool call and collect results
             tool_results: List[str] = []
+            turn_has_error = False
             for tool_cmd in tool_calls:
                 tool_cmd = tool_cmd.strip()
                 print(f"  ⚙  {tool_cmd}")
@@ -2221,6 +2278,39 @@ class AgentCore:
                     print(f"     {line}")
                 print()
                 tool_results.append(f"[{tool_cmd}]:\n{result}")
+                if result.startswith("[Error]") or result.startswith("[MCP Error]"):
+                    turn_has_error = True
+
+            # Determine if goal-seeking retry hint should be included
+            if turn_has_error:
+                failure_count += 1
+            else:
+                failure_count = 0
+
+            will_off = (self._will_level == "off")
+            retries_remaining = extra_retries - max(0, failure_count - 1)
+            include_retry_hint = (
+                turn_has_error
+                and not will_off
+                and retries_remaining > 0
+                and _turn < max_turns - 1
+            )
+
+            if include_retry_hint:
+                retry_instruction = (
+                    "\n\nOne or more tool calls returned errors.  "
+                    f"You have approximately {retries_remaining} retry attempt(s) remaining "
+                    f"(will_level={self._will_level}).  "
+                    "Please analyze what went wrong, consider an alternative approach, "
+                    "and try again — do NOT give up yet.  "
+                    "If you can achieve the user's goal a different way, do so now."
+                )
+            else:
+                retry_instruction = (
+                    "\n\nThe results above have been shown to the user. "
+                    "Please provide a brief, helpful natural language response summarising "
+                    "what you found or did."
+                )
 
             # Feed results back to the model
             messages.append({"role": "assistant", "content": response})
@@ -2229,9 +2319,7 @@ class AgentCore:
                 "content": (
                     "Tool execution results:\n\n"
                     + "\n\n".join(tool_results)
-                    + "\n\nThe results above have been shown to the user. "
-                    "Please provide a brief, helpful natural language response summarizing "
-                    "what you found or did."
+                    + retry_instruction
                 ),
             })
 
@@ -2414,6 +2502,10 @@ class AgentCore:
         if cmd == "/think":
             return self._handle_think_command(arg1)
 
+        # ── Will level ───────────────────────────
+        if cmd == "/will":
+            return self._handle_will_command(arg1)
+
         # ── MCP commands ─────────────────────────
         if cmd == "/mcp":
             return self._handle_mcp_command(arg1, arg2, raw)
@@ -2472,6 +2564,53 @@ class AgentCore:
         return (
             f"✅ Think level set to '{lvl}' "
             f"(max_tokens={THINK_MAX_TOKENS[lvl]}). "
+            f"Setting saved."
+        )
+
+    def _handle_will_command(self, level_arg: str) -> str:
+        """
+        Handle the /will command.
+
+        /will           — show current level and available options
+        /will <level>   — set persistence/retry intensity (off / low / medium / high / max)
+        """
+        if not level_arg:
+            lines = [
+                f"Current will level: {self._will_level}  "
+                f"(extra retries after failure: {WILL_EXTRA_RETRIES[self._will_level]})",
+                "",
+                "Available levels:",
+            ]
+            descriptions = {
+                "off":    "No retry — stop on first tool failure.",
+                "low":    "1 extra retry after failure; brief error analysis.",
+                "medium": "2 extra retries; agent analyzes errors and tries alternatives. (default)",
+                "high":   "3 extra retries; persistent goal-seeking with error analysis.",
+                "max":    "5 extra retries; maximum persistence toward the user's goal.",
+            }
+            for lvl in WILL_LEVELS:
+                marker = "  ◀ current" if lvl == self._will_level else ""
+                lines.append(
+                    f"  {lvl:<8} (extra_retries={WILL_EXTRA_RETRIES[lvl]:<2}) "
+                    f"— {descriptions[lvl]}{marker}"
+                )
+            lines.append("")
+            lines.append("To change: /will <level>   e.g. /will high")
+            return "\n".join(lines)
+
+        lvl = level_arg.strip().lower()
+        if lvl not in WILL_LEVELS:
+            valid = " / ".join(WILL_LEVELS)
+            return (
+                f"[Error] Unknown will level: '{level_arg}'\n"
+                f"  Valid levels: {valid}\n"
+                f"  Example: /will medium"
+            )
+        self._will_level = lvl
+        self._save_state()
+        return (
+            f"✅ Will level set to '{lvl}' "
+            f"(extra_retries={WILL_EXTRA_RETRIES[lvl]}). "
             f"Setting saved."
         )
 
@@ -2765,10 +2904,12 @@ def _run_subprocess(cmd: Union[str, List[str]], cwd: str = ".", shell: bool = Fa
             timeout=timeout,
         )
         output_parts = []
-        if result.stdout.strip():
-            output_parts.append(result.stdout.strip())
-        if result.stderr.strip():
-            output_parts.append(f"[stderr]\n{result.stderr.strip()}")
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        if stdout:
+            output_parts.append(stdout)
+        if stderr:
+            output_parts.append(f"[stderr]\n{stderr}")
         if result.returncode != 0:
             output_parts.append(f"[exit code: {result.returncode}]")
 
@@ -2780,6 +2921,8 @@ def _run_subprocess(cmd: Union[str, List[str]], cwd: str = ".", shell: bool = Fa
         return f"[Error] Command or file not found: {e}"
     except PermissionError as e:
         return f"[Error] Permission denied: {e}"
+    except Exception as e:  # catch-all so callers always get a string, never an exception
+        return f"[Error] Unexpected error running command: {e}"
 
 
 def _build_agent_system_prompt(
@@ -2914,6 +3057,18 @@ def _help_text() -> str:
           The setting is saved to ~/.sapiens2/sapiens_state.json and
           persists across restarts and updates.
 
+        WILL LEVEL (persistence / retry intensity):
+          /will                Show current level and all options
+          /will off            No retry — fail immediately on first tool error
+          /will low            1 extra retry with error analysis
+          /will medium         2 extra retries  (default)
+          /will high           3 extra retries; agent analyzes failures and tries alternatives
+          /will max            5 extra retries; maximum persistence toward the user's goal
+          When a tool call fails and will_level > off, Sapiens analyzes the error
+          and tries a different approach instead of giving up immediately.
+          The setting is saved to ~/.sapiens2/sapiens_state.json and
+          persists across restarts and updates.
+
         CONVERSATION & MEMORY:
           /new                 Start a new conversation (clears short-term memory; long-term kept)
           /reset               Full reset: clears long-term memory + model settings (with confirm)
@@ -3004,6 +3159,7 @@ def _help_text() -> str:
 
         OTHER:
           /update              Update Sapiens2.0 to the latest code (git pull + pip install)
+          /will [level]        View or set retry/persistence intensity (off/low/medium/high/max)
           /help  or  /?        Show this help text
           /exit  or  /quit     Exit Sapiens2.0
 
